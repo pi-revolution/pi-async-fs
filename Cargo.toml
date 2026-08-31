@@ -1,0 +1,18 @@
+[package]
+name = "pi_async_fs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Runtime-agnostic asynchronous filesystem contracts for local and remote storage"
+readme = "README.md"
+keywords = ["async", "filesystem", "io", "runtime-agnostic"]
+categories = ["asynchronous", "filesystem"]
+
+[dependencies]
+bytes = "1.12.1"
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+futures-core = "0.3"
+pi_atom = "0.7.0"
+pi_result = { version = "0.1.0", path = "../pi_result" }
+thiserror = "2.0.20"
+url = "2.5.8"

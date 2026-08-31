@@ -1,0 +1,10 @@
+/target/
+/docs/
+CONTEXT.md
+Cargo.lock
+.agents
+.docs
+.pi_dev_flow
+.scratch
+.idea
+AGENTS.md
