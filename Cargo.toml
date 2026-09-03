@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT"
 description = "Runtime-agnostic asynchronous filesystem contracts for local and remote storage"
 readme = "README.md"
+documentation = "https://docs.rs/pi_async_fs"
+homepage = "https://github.com/pi-revolution/pi-async-fs"
+repository = "https://github.com/pi-revolution/pi-async-fs"
 keywords = ["async", "filesystem", "io", "runtime-agnostic"]
 categories = ["asynchronous", "filesystem"]
 
