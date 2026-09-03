@@ -82,7 +82,10 @@ impl TransferProgress {
     ///
     /// `Unknown` 返回零，但这不表示实际处理量为零。
     pub fn minimum_bytes(&self) -> usize {
-        todo!("第一批次仅声明最小传输进度访问接口")
+        match self {
+            Self::Exact { bytes } | Self::AtLeast { bytes } => *bytes,
+            Self::Unknown => 0,
+        }
     }
 
     // 在进度精确时返回处理字节数，否则返回 `None`。
@@ -92,7 +95,10 @@ impl TransferProgress {
     #[must_use]
     /// 在进度精确时返回字节数，否则返回 `None`。
     pub fn exact_bytes(&self) -> Option<usize> {
-        todo!("第一批次仅声明精确传输进度访问接口")
+        match self {
+            Self::Exact { bytes } => Some(*bytes),
+            Self::AtLeast { .. } | Self::Unknown => None,
+        }
     }
 
     // 判断进度是否为一个完整、精确的字节计数。
@@ -102,7 +108,7 @@ impl TransferProgress {
     #[must_use]
     /// 仅当进度为 [`Self::Exact`] 时返回 `true`。
     pub fn is_exact(&self) -> bool {
-        todo!("第一批次仅声明精确进度判断接口")
+        matches!(self, Self::Exact { .. })
     }
 
     // 判断实际处理量是否仍然存在不确定部分。
@@ -112,28 +118,46 @@ impl TransferProgress {
     #[must_use]
     /// 当实际处理量仍可能大于可证明下限时返回 `true`。
     pub fn is_uncertain(&self) -> bool {
-        todo!("第一批次仅声明不确定进度判断接口")
+        !self.is_exact()
     }
 }
 
 impl Clone for TransferProgress {
     // 显式复制进度事实，不复制缓冲区、文件内容或后端状态。
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明 Clone 接口")
+        match self {
+            Self::Exact { bytes } => Self::Exact { bytes: *bytes },
+            Self::AtLeast { bytes } => Self::AtLeast { bytes: *bytes },
+            Self::Unknown => Self::Unknown,
+        }
     }
 }
 
 impl fmt::Debug for TransferProgress {
     // 以包含变体名称和字段名称的开发者格式显示进度。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        match self {
+            Self::Exact { bytes } => formatter
+                .debug_struct("Exact")
+                .field("bytes", bytes)
+                .finish(),
+            Self::AtLeast { bytes } => formatter
+                .debug_struct("AtLeast")
+                .field("bytes", bytes)
+                .finish(),
+            Self::Unknown => formatter.write_str("Unknown"),
+        }
     }
 }
 
 impl fmt::Display for TransferProgress {
     // 以面向日志的确定性和字节数量摘要显示进度。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        match self {
+            Self::Exact { bytes } => write!(formatter, "exactly {bytes} bytes"),
+            Self::AtLeast { bytes } => write!(formatter, "at least {bytes} bytes"),
+            Self::Unknown => formatter.write_str("unknown progress"),
+        }
     }
 }
 
@@ -143,7 +167,14 @@ impl PartialEq for TransferProgress {
     // `Exact { bytes: n }` 与 `AtLeast { bytes: n }` 不相等，因为二者对能否
     // 安全恢复或重试提供的知识不同。
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明 PartialEq 接口")
+        match (self, other) {
+            (Self::Exact { bytes: left }, Self::Exact { bytes: right })
+            | (Self::AtLeast { bytes: left }, Self::AtLeast { bytes: right }) => {
+                left == right
+            }
+            (Self::Unknown, Self::Unknown) => true,
+            _ => false,
+        }
     }
 }
 
@@ -158,7 +189,17 @@ impl Hash for TransferProgress {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明 Hash 接口")
+        match self {
+            Self::Exact { bytes } => {
+                0_u8.hash(state);
+                bytes.hash(state);
+            }
+            Self::AtLeast { bytes } => {
+                1_u8.hash(state);
+                bytes.hash(state);
+            }
+            Self::Unknown => 2_u8.hash(state),
+        }
     }
 }
 
@@ -221,12 +262,16 @@ impl<B> BufferFailure<B> {
     // 超过 `buffer` 的逻辑请求长度，因为本类型不要求 `B` 具有统一字节视图；
     // 产生写入错误的 `FileIo` 实现必须在调用本接口前完成该检查。
     //
-    // 本方法不执行 I/O、不重试操作，也不修改报告或缓冲区。第一批次只有
-    // 声明，后续真实实现计划为 O(1) 移动字段。
+    // 本方法不执行 I/O、不重试操作，也不修改报告或缓冲区，只以 O(1)
+    // 移动字段形成失败载体。
     #[must_use]
     /// 按“错误、原始输入、进度”的顺序构造失败值。
     pub fn new(error: Error, buffer: B, progress: TransferProgress) -> Self {
-        todo!("第一批次仅声明缓冲区错误恢复载体构造接口")
+        Self {
+            error,
+            buffer,
+            progress,
+        }
     }
 
     // 借用统一的 `pi_result` 错误报告。
@@ -236,7 +281,7 @@ impl<B> BufferFailure<B> {
     #[must_use]
     /// 返回失败诊断的共享引用。
     pub fn error(&self) -> &Error {
-        todo!("第一批次仅声明错误报告访问接口")
+        &self.error
     }
 
     // 共享借用尚未被取回的原始缓冲区值。
@@ -248,7 +293,7 @@ impl<B> BufferFailure<B> {
     #[must_use]
     /// 返回原始输入值的共享引用。
     pub fn buffer(&self) -> &B {
-        todo!("第一批次仅声明原始缓冲区共享访问接口")
+        &self.buffer
     }
 
     // 借用与本次普通错误对应的传输进度。
@@ -258,7 +303,7 @@ impl<B> BufferFailure<B> {
     #[must_use]
     /// 返回可证明进度的共享引用。
     pub fn progress(&self) -> &TransferProgress {
-        todo!("第一批次仅声明错误传输进度访问接口")
+        &self.progress
     }
 
     // 一次性拆解错误报告、原始缓冲区和传输进度。
@@ -269,7 +314,7 @@ impl<B> BufferFailure<B> {
     #[must_use]
     /// 消费失败值并按构造顺序返回全部字段。
     pub fn into_parts(self) -> (Error, B, TransferProgress) {
-        todo!("第一批次仅声明缓冲区错误恢复载体拆解接口")
+        (self.error, self.buffer, self.progress)
     }
 }
 
@@ -281,7 +326,13 @@ impl<B> fmt::Debug for BufferFailure<B> {
     // 执行文件/网络 I/O，不消费恢复资产；错误报告自身的调试成本仍由其已有
     // frame 与 attachment 数量决定。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        formatter
+            .debug_struct("BufferFailure")
+            .field("error", &self.error)
+            .field("buffer_type", &core::any::type_name::<B>())
+            .field("buffer", &"<redacted>")
+            .field("progress", &self.progress)
+            .finish()
     }
 }
 
@@ -291,6 +342,10 @@ impl<B> fmt::Display for BufferFailure<B> {
     // 输出故意省略 `B` 的类型和全部内容，不能用来恢复、解析、序列化或判断
     // 缓冲区身份。格式化失败只通过 `fmt::Error` 返回，不改变任何所有权。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        write!(
+            formatter,
+            "{}; progress: {}",
+            self.error, self.progress
+        )
     }
 }

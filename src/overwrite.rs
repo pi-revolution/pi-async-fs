@@ -100,21 +100,45 @@ pub enum OverwriteTargetEvidence {
 impl fmt::Debug for OverwriteTargetEvidence {
     // 以包含变体名称和公开字段名称的开发者格式显示证据。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明覆盖目标证据 Debug 接口")
+        match self {
+            Self::Unchanged => formatter.write_str("Unchanged"),
+            Self::ExactInputPrefix { bytes } => formatter
+                .debug_struct("ExactInputPrefix")
+                .field("bytes", bytes)
+                .finish(),
+            Self::MutationStarted => formatter.write_str("MutationStarted"),
+            Self::Unknown => formatter.write_str("Unknown"),
+        }
     }
 }
 
 impl fmt::Display for OverwriteTargetEvidence {
     // 以面向日志的人类可读摘要显示证据，不承诺可反向解析。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明覆盖目标证据 Display 接口")
+        match self {
+            Self::Unchanged => formatter.write_str("target unchanged"),
+            Self::ExactInputPrefix { bytes } => {
+                write!(formatter, "target is exact input prefix of {bytes} bytes")
+            }
+            Self::MutationStarted => formatter.write_str("target mutation started"),
+            Self::Unknown => formatter.write_str("target state unknown"),
+        }
     }
 }
 
 impl PartialEq for OverwriteTargetEvidence {
     // 按证据变体及 `bytes` 字段判等。
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明覆盖目标证据 PartialEq 接口")
+        match (self, other) {
+            (Self::Unchanged, Self::Unchanged)
+            | (Self::MutationStarted, Self::MutationStarted)
+            | (Self::Unknown, Self::Unknown) => true,
+            (
+                Self::ExactInputPrefix { bytes: left },
+                Self::ExactInputPrefix { bytes: right },
+            ) => left == right,
+            _ => false,
+        }
     }
 }
 
@@ -123,14 +147,29 @@ impl Eq for OverwriteTargetEvidence {}
 impl PartialOrd for OverwriteTargetEvidence {
     // 返回与 [`Ord`] 一致的证据标签与字段全序。
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明覆盖目标证据 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for OverwriteTargetEvidence {
     // 按变体声明顺序及字段比较，不表达证据强度或恢复优先级。
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明覆盖目标证据 Ord 接口")
+        fn rank(evidence: &OverwriteTargetEvidence) -> u8 {
+            match evidence {
+                OverwriteTargetEvidence::Unchanged => 0,
+                OverwriteTargetEvidence::ExactInputPrefix { .. } => 1,
+                OverwriteTargetEvidence::MutationStarted => 2,
+                OverwriteTargetEvidence::Unknown => 3,
+            }
+        }
+
+        rank(self).cmp(&rank(other)).then_with(|| match (self, other) {
+            (
+                Self::ExactInputPrefix { bytes: left },
+                Self::ExactInputPrefix { bytes: right },
+            ) => left.cmp(right),
+            _ => Ordering::Equal,
+        })
     }
 }
 
@@ -140,7 +179,15 @@ impl Hash for OverwriteTargetEvidence {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明覆盖目标证据 Hash 接口")
+        match self {
+            Self::Unchanged => 0_u8.hash(state),
+            Self::ExactInputPrefix { bytes } => {
+                1_u8.hash(state);
+                bytes.hash(state);
+            }
+            Self::MutationStarted => 2_u8.hash(state),
+            Self::Unknown => 3_u8.hash(state),
+        }
     }
 }
 
@@ -254,7 +301,12 @@ impl<B> OverwriteFailure<B> {
         progress: TransferProgress,
         target_evidence: OverwriteTargetEvidence,
     ) -> Self {
-        todo!("第一批次仅声明覆盖错误恢复载体构造接口")
+        Self {
+            error,
+            buffer,
+            progress,
+            target_evidence,
+        }
     }
 
     // 共享借用本次普通覆盖错误的统一 `pi_result` 诊断报告。
@@ -279,7 +331,7 @@ impl<B> OverwriteFailure<B> {
     #[must_use]
     /// 返回失败诊断的共享引用。
     pub fn error(&self) -> &Error {
-        todo!("第一批次仅声明覆盖错误报告访问接口")
+        &self.error
     }
 
     // 共享借用已恢复但尚未被取回的原始 buffer 值。
@@ -312,7 +364,7 @@ impl<B> OverwriteFailure<B> {
     #[must_use]
     /// 返回原始缓冲区的共享引用。
     pub fn buffer(&self) -> &B {
-        todo!("第一批次仅声明覆盖错误原始 buffer 访问接口")
+        &self.buffer
     }
 
     // 共享借用本次覆盖对权威输入连续前缀的可证明处理进度。
@@ -344,7 +396,7 @@ impl<B> OverwriteFailure<B> {
     #[must_use]
     /// 返回可证明传输进度的共享引用。
     pub fn progress(&self) -> &TransferProgress {
-        todo!("第一批次仅声明覆盖错误输入进度访问接口")
+        &self.progress
     }
 
     // 共享借用普通错误完成点已记录的目标文件状态证据。
@@ -382,7 +434,7 @@ impl<B> OverwriteFailure<B> {
     #[must_use]
     /// 返回目标内容证据的共享引用。
     pub fn target_evidence(&self) -> &OverwriteTargetEvidence {
-        todo!("第一批次仅声明覆盖错误目标证据访问接口")
+        &self.target_evidence
     }
 
     // 一次性拆解诊断报告、原始 buffer、输入进度和目标证据。
@@ -422,7 +474,12 @@ impl<B> OverwriteFailure<B> {
         TransferProgress,
         OverwriteTargetEvidence,
     ) {
-        todo!("第一批次仅声明覆盖错误恢复载体拆解接口")
+        (
+            self.error,
+            self.buffer,
+            self.progress,
+            self.target_evidence,
+        )
     }
 }
 
@@ -432,7 +489,14 @@ impl<B> fmt::Debug for OverwriteFailure<B> {
     // 该实现不要求 `B: Debug`，不得输出原始文件内容、备用容量、指针、引用
     // 计数、池槽位或原生句柄。格式化不执行文件或网络 I/O，也不消费恢复资产。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明覆盖错误恢复载体 Debug 接口")
+        formatter
+            .debug_struct("OverwriteFailure")
+            .field("error", &self.error)
+            .field("buffer_type", &core::any::type_name::<B>())
+            .field("buffer", &"<redacted>")
+            .field("progress", &self.progress)
+            .field("target_evidence", &self.target_evidence)
+            .finish()
     }
 }
 
@@ -442,6 +506,10 @@ impl<B> fmt::Display for OverwriteFailure<B> {
     // 输出故意省略 `B` 的类型和全部内容，不能用来恢复、解析、序列化或判断
     // buffer 身份。格式化失败只通过 `fmt::Error` 返回，不改变任何所有权。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明覆盖错误恢复载体 Display 接口")
+        write!(
+            formatter,
+            "{}; progress: {}; target: {}",
+            self.error, self.progress, self.target_evidence
+        )
     }
 }

@@ -254,21 +254,51 @@ pub enum CopyTargetEvidence {
 impl fmt::Debug for CopyTargetEvidence {
     // 以包含变体名称和公开字节字段的开发者格式显示证据。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明复制目标证据 Debug 接口")
+        match self {
+            Self::NotPublishedByOperation => {
+                formatter.write_str("NotPublishedByOperation")
+            }
+            Self::PublicationUnknown { content_byte_len } => formatter
+                .debug_struct("PublicationUnknown")
+                .field("content_byte_len", content_byte_len)
+                .finish(),
+        }
     }
 }
 
 impl fmt::Display for CopyTargetEvidence {
     // 输出面向日志的人类可读摘要，不承诺可反向解析。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明复制目标证据 Display 接口")
+        match self {
+            Self::NotPublishedByOperation => {
+                formatter.write_str("target not published by operation")
+            }
+            Self::PublicationUnknown { content_byte_len } => write!(
+                formatter,
+                "target publication outcome unknown; complete content length: {content_byte_len} bytes"
+            ),
+        }
     }
 }
 
 impl PartialEq for CopyTargetEvidence {
     // 按证据变体及其字节字段判等。
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明复制目标证据 PartialEq 接口")
+        match (self, other) {
+            (
+                Self::NotPublishedByOperation,
+                Self::NotPublishedByOperation,
+            ) => true,
+            (
+                Self::PublicationUnknown {
+                    content_byte_len: left,
+                },
+                Self::PublicationUnknown {
+                    content_byte_len: right,
+                },
+            ) => left == right,
+            _ => false,
+        }
     }
 }
 
@@ -277,14 +307,29 @@ impl Eq for CopyTargetEvidence {}
 impl PartialOrd for CopyTargetEvidence {
     // 返回与 [`Ord`] 一致的证据标签和字段全序。
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明复制目标证据 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for CopyTargetEvidence {
     // 按变体声明顺序和字节字段比较，不表达完成度或恢复优先级。
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明复制目标证据 Ord 接口")
+        match (self, other) {
+            (
+                Self::NotPublishedByOperation,
+                Self::NotPublishedByOperation,
+            ) => Ordering::Equal,
+            (Self::NotPublishedByOperation, _) => Ordering::Less,
+            (_, Self::NotPublishedByOperation) => Ordering::Greater,
+            (
+                Self::PublicationUnknown {
+                    content_byte_len: left,
+                },
+                Self::PublicationUnknown {
+                    content_byte_len: right,
+                },
+            ) => left.cmp(right),
+        }
     }
 }
 
@@ -294,7 +339,13 @@ impl Hash for CopyTargetEvidence {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明复制目标证据 Hash 接口")
+        match self {
+            Self::NotPublishedByOperation => 0_u8.hash(state),
+            Self::PublicationUnknown { content_byte_len } => {
+                1_u8.hash(state);
+                content_byte_len.hash(state);
+            }
+        }
     }
 }
 
@@ -403,21 +454,39 @@ pub enum CopyStagingEvidence {
 impl fmt::Debug for CopyStagingEvidence {
     // 以包含暂存证据变体名称的开发者格式显示。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明复制暂存证据 Debug 接口")
+        formatter.write_str(match self {
+            Self::NotCreatedByOperation => "NotCreatedByOperation",
+            Self::CreatedThenRemovedByOperation => {
+                "CreatedThenRemovedByOperation"
+            }
+            Self::KnownPresentAtCompletion => "KnownPresentAtCompletion",
+            Self::Unknown => "Unknown",
+        })
     }
 }
 
 impl fmt::Display for CopyStagingEvidence {
     // 输出面向日志的人类可读暂存摘要，不承诺可反向解析。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明复制暂存证据 Display 接口")
+        formatter.write_str(match self {
+            Self::NotCreatedByOperation => {
+                "staging object not created by operation"
+            }
+            Self::CreatedThenRemovedByOperation => {
+                "staging object created then removed by operation"
+            }
+            Self::KnownPresentAtCompletion => {
+                "staging object known present at completion"
+            }
+            Self::Unknown => "staging object outcome unknown",
+        })
     }
 }
 
 impl PartialEq for CopyStagingEvidence {
     // 仅在两个值表示相同暂存证据变体时判等。
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明复制暂存证据 PartialEq 接口")
+        core::mem::discriminant(self) == core::mem::discriminant(other)
     }
 }
 
@@ -426,14 +495,23 @@ impl Eq for CopyStagingEvidence {}
 impl PartialOrd for CopyStagingEvidence {
     // 返回与 [`Ord`] 一致的暂存证据变体全序。
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明复制暂存证据 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for CopyStagingEvidence {
     // 按变体声明顺序比较，不表达清理质量或恢复优先级。
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明复制暂存证据 Ord 接口")
+        fn tag(value: &CopyStagingEvidence) -> u8 {
+            match value {
+                CopyStagingEvidence::NotCreatedByOperation => 0,
+                CopyStagingEvidence::CreatedThenRemovedByOperation => 1,
+                CopyStagingEvidence::KnownPresentAtCompletion => 2,
+                CopyStagingEvidence::Unknown => 3,
+            }
+        }
+
+        tag(self).cmp(&tag(other))
     }
 }
 
@@ -443,7 +521,7 @@ impl Hash for CopyStagingEvidence {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明复制暂存证据 Hash 接口")
+        core::mem::discriminant(self).hash(state)
     }
 }
 
@@ -509,7 +587,7 @@ impl CopyOutcome {
     #[must_use]
     /// 以目标主内容的精确逻辑字节长度构造成功结果。
     pub fn new(content_byte_len: u64) -> Self {
-        todo!("第一批次仅声明复制成功结果构造接口")
+        Self { content_byte_len }
     }
 
     // 返回复制完成点目标主内容的精确逻辑字节长度。
@@ -520,28 +598,35 @@ impl CopyOutcome {
     #[must_use]
     /// 返回成功提交点的目标主内容逻辑字节长度。
     pub fn content_byte_len(&self) -> u64 {
-        todo!("第一批次仅声明复制成功逻辑长度访问接口")
+        self.content_byte_len
     }
 }
 
 impl fmt::Debug for CopyOutcome {
     // 以包含字段名和字节单位的开发者格式显示成功结果。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明复制成功结果 Debug 接口")
+        formatter
+            .debug_struct("CopyOutcome")
+            .field("content_byte_len", &self.content_byte_len)
+            .finish()
     }
 }
 
 impl fmt::Display for CopyOutcome {
     // 输出面向日志的逻辑内容长度摘要，不承诺可反向解析。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明复制成功结果 Display 接口")
+        write!(
+            formatter,
+            "copied content length: {} bytes",
+            self.content_byte_len
+        )
     }
 }
 
 impl PartialEq for CopyOutcome {
     // 仅按目标主内容逻辑长度判等。
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明复制成功结果 PartialEq 接口")
+        self.content_byte_len == other.content_byte_len
     }
 }
 
@@ -550,14 +635,14 @@ impl Eq for CopyOutcome {}
 impl PartialOrd for CopyOutcome {
     // 返回与 [`Ord`] 一致的逻辑长度全序。
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明复制成功结果 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for CopyOutcome {
     // 按目标主内容逻辑长度比较，不表达复制质量或恢复优先级。
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明复制成功结果 Ord 接口")
+        self.content_byte_len.cmp(&other.content_byte_len)
     }
 }
 
@@ -567,7 +652,7 @@ impl Hash for CopyOutcome {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明复制成功结果 Hash 接口")
+        self.content_byte_len.hash(state)
     }
 }
 
@@ -655,7 +740,11 @@ impl CopyFailure {
         target_evidence: CopyTargetEvidence,
         staging_evidence: CopyStagingEvidence,
     ) -> Self {
-        todo!("第一批次仅声明复制失败载体构造接口")
+        Self {
+            error,
+            target_evidence,
+            staging_evidence,
+        }
     }
 
     // 共享借用本次复制失败的统一诊断报告。
@@ -668,7 +757,7 @@ impl CopyFailure {
     #[must_use]
     /// 返回失败诊断的共享引用。
     pub fn error(&self) -> &Error {
-        todo!("第一批次仅声明复制失败诊断访问接口")
+        &self.error
     }
 
     // 共享借用本次复制对目标产生的可证明副作用。
@@ -681,7 +770,7 @@ impl CopyFailure {
     #[must_use]
     /// 返回最终目标发布证据的共享引用。
     pub fn target_evidence(&self) -> &CopyTargetEvidence {
-        todo!("第一批次仅声明复制失败目标证据访问接口")
+        &self.target_evidence
     }
 
     // 共享借用本次复制对内部暂存资源产生的可证明副作用。
@@ -695,7 +784,7 @@ impl CopyFailure {
     #[must_use]
     /// 返回中间产物生命周期证据的共享引用。
     pub fn staging_evidence(&self) -> &CopyStagingEvidence {
-        todo!("第一批次仅声明复制失败暂存证据访问接口")
+        &self.staging_evidence
     }
 
     // 消费失败载体并取回统一诊断、目标证据与暂存证据。
@@ -712,20 +801,29 @@ impl CopyFailure {
     pub fn into_parts(
         self,
     ) -> (Error, CopyTargetEvidence, CopyStagingEvidence) {
-        todo!("第一批次仅声明复制失败载体拆解接口")
+        (self.error, self.target_evidence, self.staging_evidence)
     }
 }
 
 impl fmt::Debug for CopyFailure {
     // 显示统一诊断、目标证据与暂存证据的脱敏开发者摘要。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明复制失败载体 Debug 接口")
+        formatter
+            .debug_struct("CopyFailure")
+            .field("error", &self.error)
+            .field("target_evidence", &self.target_evidence)
+            .field("staging_evidence", &self.staging_evidence)
+            .finish()
     }
 }
 
 impl fmt::Display for CopyFailure {
     // 输出面向日志的失败摘要，不承诺可反向解析或稳定文本协议。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明复制失败载体 Display 接口")
+        write!(
+            formatter,
+            "{}; target: {}; staging: {}",
+            self.error, self.target_evidence, self.staging_evidence
+        )
     }
 }

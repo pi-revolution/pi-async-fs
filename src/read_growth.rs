@@ -5,7 +5,7 @@
 // 表达一次调用最多获准新增多少有效字节；它不拥有缓冲区、不执行分配、
 // 不读取文件，也不授予实现提前暴露未初始化内存的权限。
 //
-// 第一批次的增长型核心读取只采用尾部追加语义。需要替换旧内容的调用方
+// 当前增长型核心读取只采用尾部追加语义。需要替换旧内容的调用方
 // 应在调用前显式清空承载体，或传入一个新的空承载体；本模块不提供会在
 // 异步操作开始时破坏旧内容的 `Replace` 模式。
 
@@ -42,7 +42,7 @@ pub enum ReadGrowthLimitError {
 
 impl ClassifyErrorKind for ReadGrowthLimitError {
     fn classify_error_kind(&self) -> ErrorKind {
-        todo!("第一批次仅声明增长上限错误分类接口")
+        ErrorKind::InvalidInput
     }
 }
 
@@ -102,7 +102,9 @@ impl ReadGrowthLimit {
     #[must_use]
     /// 从最大新增字节数构造上限。
     pub fn new(max_additional_bytes: usize) -> Self {
-        todo!("第一批次仅声明增长上限构造接口")
+        Self {
+            max_additional_bytes,
+        }
     }
 
     // 返回本次调用最多获准追加的有效字节数。
@@ -112,7 +114,7 @@ impl ReadGrowthLimit {
     #[must_use]
     /// 返回本次允许新增的最大字节数。
     pub fn max_additional_bytes(&self) -> usize {
-        todo!("第一批次仅声明最大新增量访问接口")
+        self.max_additional_bytes
     }
 
     // 把上限绑定到操作开始时的真实有效长度，并返回最大最终有效长度。
@@ -128,7 +130,12 @@ impl ReadGrowthLimit {
     ///
     /// 溢出时返回 [`ReadGrowthLimitError`]。
     pub fn checked_final_len(&self, current_len: usize) -> RawResult<usize, ReadGrowthLimitError> {
-        todo!("第一批次仅声明增长上限绑定接口")
+        current_len.checked_add(self.max_additional_bytes).ok_or(
+            ReadGrowthLimitError::FinalLengthOverflow {
+                current_len,
+                max_additional_bytes: self.max_additional_bytes,
+            },
+        )
     }
 }
 
@@ -138,28 +145,35 @@ impl Clone for ReadGrowthLimit {
     // 克隆不共享可变状态、不分配且不扩大任何已经开始的读取权限；具体读取
     // 仍须分别绑定自身操作开始时的真实长度。
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明 Clone 接口")
+        Self::new(self.max_additional_bytes)
     }
 }
 
 impl fmt::Debug for ReadGrowthLimit {
     // 以包含字段名称的开发者格式显示增长上限，不访问任何外部状态。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        formatter
+            .debug_struct("ReadGrowthLimit")
+            .field("max_additional_bytes", &self.max_additional_bytes)
+            .finish()
     }
 }
 
 impl fmt::Display for ReadGrowthLimit {
     // 以面向日志和诊断的字节数量格式显示增长上限。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        write!(
+            formatter,
+            "maximum additional bytes: {}",
+            self.max_additional_bytes
+        )
     }
 }
 
 impl PartialEq for ReadGrowthLimit {
     // 按最大新增字节数判等，不读取承载体或后端状态。
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明 PartialEq 接口")
+        self.max_additional_bytes == other.max_additional_bytes
     }
 }
 
@@ -168,14 +182,15 @@ impl Eq for ReadGrowthLimit {}
 impl PartialOrd for ReadGrowthLimit {
     // 按最大新增字节数提供与 [`Ord`] 一致的全序比较。
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for ReadGrowthLimit {
     // 按最大新增字节数升序比较；数值更大只表示权限上限更高。
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明 Ord 接口")
+        self.max_additional_bytes
+            .cmp(&other.max_additional_bytes)
     }
 }
 
@@ -185,7 +200,7 @@ impl Hash for ReadGrowthLimit {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明 Hash 接口")
+        self.max_additional_bytes.hash(state);
     }
 }
 
@@ -260,7 +275,10 @@ impl ReadGrowthOutcome {
     #[must_use]
     /// 返回本次成功新增并提交的字节数。
     pub fn appended_bytes(&self) -> usize {
-        todo!("第一批次仅声明增长读取提交进度访问接口")
+        match self {
+            Self::EndOfFile { appended_bytes }
+            | Self::LimitReached { appended_bytes } => *appended_bytes,
+        }
     }
 
     // 判断调用是否在耗尽上限前明确观察到文件结束。
@@ -271,7 +289,7 @@ impl ReadGrowthOutcome {
     #[must_use]
     /// 仅当调用明确在上限内观察到文件尾时返回 `true`。
     pub fn is_end_of_file(&self) -> bool {
-        todo!("第一批次仅声明增长读取 EOF 判断接口")
+        matches!(self, Self::EndOfFile { .. })
     }
 
     // 判断调用是否因为最大新增量已经用尽而停止。
@@ -281,35 +299,78 @@ impl ReadGrowthOutcome {
     #[must_use]
     /// 仅当调用精确用尽增长上限时返回 `true`。
     pub fn is_limit_reached(&self) -> bool {
-        todo!("第一批次仅声明增长读取上限判断接口")
+        matches!(self, Self::LimitReached { .. })
     }
 }
 
 impl Clone for ReadGrowthOutcome {
     // 显式复制成功终止分类和数值进度，不复制任何承载体内容。
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明 Clone 接口")
+        match self {
+            Self::EndOfFile { appended_bytes } => Self::EndOfFile {
+                appended_bytes: *appended_bytes,
+            },
+            Self::LimitReached { appended_bytes } => Self::LimitReached {
+                appended_bytes: *appended_bytes,
+            },
+        }
     }
 }
 
 impl fmt::Debug for ReadGrowthOutcome {
     // 以包含变体名称和字段名称的开发者格式显示成功结果。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        match self {
+            Self::EndOfFile { appended_bytes } => formatter
+                .debug_struct("EndOfFile")
+                .field("appended_bytes", appended_bytes)
+                .finish(),
+            Self::LimitReached { appended_bytes } => formatter
+                .debug_struct("LimitReached")
+                .field("appended_bytes", appended_bytes)
+                .finish(),
+        }
     }
 }
 
 impl fmt::Display for ReadGrowthOutcome {
     // 以面向日志的终止原因与已追加字节数显示成功结果。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        match self {
+            Self::EndOfFile { appended_bytes } => write!(
+                formatter,
+                "end of file after appending {appended_bytes} bytes"
+            ),
+            Self::LimitReached { appended_bytes } => write!(
+                formatter,
+                "growth limit reached after appending {appended_bytes} bytes"
+            ),
+        }
     }
 }
 
 impl PartialEq for ReadGrowthOutcome {
     // 按终止原因和已追加字节数判等。
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明 PartialEq 接口")
+        match (self, other) {
+            (
+                Self::EndOfFile {
+                    appended_bytes: left,
+                },
+                Self::EndOfFile {
+                    appended_bytes: right,
+                },
+            )
+            | (
+                Self::LimitReached {
+                    appended_bytes: left,
+                },
+                Self::LimitReached {
+                    appended_bytes: right,
+                },
+            ) => left == right,
+            _ => false,
+        }
     }
 }
 
@@ -318,7 +379,7 @@ impl Eq for ReadGrowthOutcome {}
 impl PartialOrd for ReadGrowthOutcome {
     // 返回与 [`Ord`] 一致的全序比较结果。
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
@@ -328,7 +389,26 @@ impl Ord for ReadGrowthOutcome {
     // 冻结顺序为 `EndOfFile < LimitReached`。该顺序只服务确定性集合、排序和
     // 诊断，不表示成功等级、时间先后或是否应该继续读取。
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明 Ord 接口")
+        match (self, other) {
+            (
+                Self::EndOfFile {
+                    appended_bytes: left,
+                },
+                Self::EndOfFile {
+                    appended_bytes: right,
+                },
+            )
+            | (
+                Self::LimitReached {
+                    appended_bytes: left,
+                },
+                Self::LimitReached {
+                    appended_bytes: right,
+                },
+            ) => left.cmp(right),
+            (Self::EndOfFile { .. }, Self::LimitReached { .. }) => Ordering::Less,
+            (Self::LimitReached { .. }, Self::EndOfFile { .. }) => Ordering::Greater,
+        }
     }
 }
 
@@ -338,6 +418,15 @@ impl Hash for ReadGrowthOutcome {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明 Hash 接口")
+        match self {
+            Self::EndOfFile { appended_bytes } => {
+                0_u8.hash(state);
+                appended_bytes.hash(state);
+            }
+            Self::LimitReached { appended_bytes } => {
+                1_u8.hash(state);
+                appended_bytes.hash(state);
+            }
+        }
     }
 }

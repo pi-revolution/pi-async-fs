@@ -56,35 +56,65 @@ impl WalkDepthLimit {
     #[must_use]
     /// 返回包含式最大深度；无限时返回 `None`。
     pub fn maximum_depth(&self) -> Option<usize> {
-        todo!("第一批次仅声明遍历最大深度查询接口")
+        match self {
+            Self::Unlimited => None,
+            Self::Limited { max_depth } => Some(*max_depth),
+        }
     }
 }
 
 impl Clone for WalkDepthLimit {
     // 显式复制变体和标量上限，不复制遍历状态。
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明 Clone 接口")
+        match self {
+            Self::Unlimited => Self::Unlimited,
+            Self::Limited { max_depth } => Self::Limited {
+                max_depth: *max_depth,
+            },
+        }
     }
 }
 
 impl fmt::Debug for WalkDepthLimit {
     // 以变体名称和字段名称显示开发者格式。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        match self {
+            Self::Unlimited => formatter.write_str("Unlimited"),
+            Self::Limited { max_depth } => formatter
+                .debug_struct("Limited")
+                .field("max_depth", max_depth)
+                .finish(),
+        }
     }
 }
 
 impl fmt::Display for WalkDepthLimit {
     // 显示明确的无限或包含式最大深度摘要。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        match self {
+            Self::Unlimited => formatter.write_str("unlimited depth"),
+            Self::Limited { max_depth } => {
+                write!(formatter, "maximum depth: {max_depth}")
+            }
+        }
     }
 }
 
 impl PartialEq for WalkDepthLimit {
     // 按变体和有限上限值判等。
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明 PartialEq 接口")
+        match (self, other) {
+            (Self::Unlimited, Self::Unlimited) => true,
+            (
+                Self::Limited {
+                    max_depth: left,
+                },
+                Self::Limited {
+                    max_depth: right,
+                },
+            ) => left == right,
+            _ => false,
+        }
     }
 }
 
@@ -93,14 +123,26 @@ impl Eq for WalkDepthLimit {}
 impl PartialOrd for WalkDepthLimit {
     // 按语义上限比较；无限大于任何有限上限。
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for WalkDepthLimit {
     // 按语义上限建立全序；有限值按数值排序，无限位于最后。
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明 Ord 接口")
+        match (self, other) {
+            (
+                Self::Limited {
+                    max_depth: left,
+                },
+                Self::Limited {
+                    max_depth: right,
+                },
+            ) => left.cmp(right),
+            (Self::Limited { .. }, Self::Unlimited) => Ordering::Less,
+            (Self::Unlimited, Self::Limited { .. }) => Ordering::Greater,
+            (Self::Unlimited, Self::Unlimited) => Ordering::Equal,
+        }
     }
 }
 
@@ -110,7 +152,15 @@ impl Hash for WalkDepthLimit {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明 Hash 接口")
+        match self {
+            Self::Limited { max_depth } => {
+                0_u8.hash(state);
+                max_depth.hash(state);
+            }
+            Self::Unlimited => {
+                1_u8.hash(state);
+            }
+        }
     }
 }
 
@@ -157,35 +207,38 @@ impl WalkOptions {
     #[must_use]
     /// 使用显式深度限制构造遍历选项。
     pub fn new(depth_limit: WalkDepthLimit) -> Self {
-        todo!("第一批次仅声明递归遍历选项构造接口")
+        Self { depth_limit }
     }
 }
 
 impl Clone for WalkOptions {
     // 显式克隆纯选项值，不克隆任何活动遍历流或后端状态。
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明 Clone 接口")
+        Self::new(self.depth_limit.clone())
     }
 }
 
 impl fmt::Debug for WalkOptions {
     // 以字段名称和完整深度限制显示开发者格式。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        formatter
+            .debug_struct("WalkOptions")
+            .field("depth_limit", &self.depth_limit)
+            .finish()
     }
 }
 
 impl fmt::Display for WalkOptions {
     // 显示面向人类的遍历深度选项摘要。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        write!(formatter, "depth limit: {}", self.depth_limit)
     }
 }
 
 impl PartialEq for WalkOptions {
     // 按全部稳定选项字段判等。
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明 PartialEq 接口")
+        self.depth_limit == other.depth_limit
     }
 }
 
@@ -194,14 +247,14 @@ impl Eq for WalkOptions {}
 impl PartialOrd for WalkOptions {
     // 按字段顺序进行部分比较。
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for WalkOptions {
     // 按字段顺序进行全序比较，只用于集合和确定性输出。
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明 Ord 接口")
+        self.depth_limit.cmp(&other.depth_limit)
     }
 }
 
@@ -211,7 +264,7 @@ impl Hash for WalkOptions {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明 Hash 接口")
+        self.depth_limit.hash(state);
     }
 }
 
@@ -241,7 +294,9 @@ impl Hash for WalkOptions {
 /// 递归目录遍历产生的一个拥有型后代项目。
 ///
 /// 根本身不会形成本类型；直接子项深度为一。单个项目可以在遍历流释放后
-/// 保存，但不代表整个遍历是快照，也不编码遍历顺序。
+/// 保存，但不代表整个遍历是快照，也不编码遍历顺序。项目包含远端
+/// [`DirectoryEntry`] 时，继承其中 [`crate::EntryName`] 的跨线程安全依赖图
+/// 前置条件。
 pub struct WalkEntry<L> {
     // 当前后代的轻量目录项。
     /// 当前后代的轻量目录项。
@@ -265,7 +320,7 @@ impl<L> WalkEntry<L> {
     #[must_use]
     /// 按“目录项、深度”的顺序构造遍历项目。
     pub fn new(entry: DirectoryEntry<L>, depth: NonZeroUsize) -> Self {
-        todo!("第一批次仅声明递归遍历项目构造接口")
+        Self { entry, depth }
     }
 
     // 消费本值并取回轻量目录项与非零深度。
@@ -280,7 +335,7 @@ impl<L> WalkEntry<L> {
     #[must_use]
     /// 消费项目并按构造顺序返回目录项和深度。
     pub fn into_parts(self) -> (DirectoryEntry<L>, NonZeroUsize) {
-        todo!("第一批次仅声明递归遍历项目拆分接口")
+        (self.entry, self.depth)
     }
 }
 
@@ -293,7 +348,7 @@ where
     // 这不克隆遍历流、已打开目录或 namespace；定位符的具体
     // 克隆成本由 `L` 决定。
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明 Clone 接口")
+        Self::new(self.entry.clone(), self.depth)
     }
 }
 
@@ -303,7 +358,11 @@ where
 {
     // 以包含字段名称的开发者格式显示项目和深度。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        formatter
+            .debug_struct("WalkEntry")
+            .field("entry", &self.entry)
+            .field("depth", &self.depth)
+            .finish()
     }
 }
 
@@ -316,7 +375,7 @@ where
     // 本合同只要求 `L: Debug`，使不直接实现 `Display` 的非 UTF-8
     // 原生路径仍能获得安全、可诊断的显示形式。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        write!(formatter, "{:?} at depth {}", self.entry, self.depth)
     }
 }
 
@@ -326,7 +385,7 @@ where
 {
     // 按完整目录项与深度联合判等。
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明 PartialEq 接口")
+        self.entry == other.entry && self.depth == other.depth
     }
 }
 
@@ -338,7 +397,10 @@ where
 {
     // 按目录项后深度的字段顺序进行部分比较。
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明 PartialOrd 接口")
+        match self.entry.partial_cmp(&other.entry)? {
+            Ordering::Equal => self.depth.partial_cmp(&other.depth),
+            ordering => Some(ordering),
+        }
     }
 }
 
@@ -350,7 +412,9 @@ where
     //
     // 该顺序只服务集合与确定性输出，不表示遍历产生顺序。
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明 Ord 接口")
+        self.entry
+            .cmp(&other.entry)
+            .then_with(|| self.depth.cmp(&other.depth))
     }
 }
 
@@ -363,6 +427,7 @@ where
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明 Hash 接口")
+        self.entry.hash(state);
+        self.depth.hash(state);
     }
 }

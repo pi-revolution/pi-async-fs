@@ -7,8 +7,9 @@
 use core::cmp::Ordering;
 use core::fmt;
 use core::hash::{Hash, Hasher};
+use chrono::{DateTime, SecondsFormat, Utc};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 文件系统对象的可移植种类。
 ///
@@ -39,27 +40,85 @@ pub enum FileType {
     Unknown,
 }
 
+impl FileType {
+    fn rank(&self) -> u8 {
+        match self {
+            Self::RegularFile => 0,
+            Self::Directory => 1,
+            Self::SymbolicLink => 2,
+            Self::RemoteObject => 3,
+            Self::BlockDevice => 4,
+            Self::CharacterDevice => 5,
+            Self::Fifo => 6,
+            Self::Socket => 7,
+            Self::Other => 8,
+            Self::Unknown => 9,
+        }
+    }
+
+    fn debug_name(&self) -> &'static str {
+        match self {
+            Self::RegularFile => "RegularFile",
+            Self::Directory => "Directory",
+            Self::SymbolicLink => "SymbolicLink",
+            Self::RemoteObject => "RemoteObject",
+            Self::BlockDevice => "BlockDevice",
+            Self::CharacterDevice => "CharacterDevice",
+            Self::Fifo => "Fifo",
+            Self::Socket => "Socket",
+            Self::Other => "Other",
+            Self::Unknown => "Unknown",
+        }
+    }
+
+    fn display_name(&self) -> &'static str {
+        match self {
+            Self::RegularFile => "regular file",
+            Self::Directory => "directory",
+            Self::SymbolicLink => "symbolic link",
+            Self::RemoteObject => "remote object",
+            Self::BlockDevice => "block device",
+            Self::CharacterDevice => "character device",
+            Self::Fifo => "fifo",
+            Self::Socket => "socket",
+            Self::Other => "other",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 impl Clone for FileType {
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明 Clone 接口")
+        match self {
+            Self::RegularFile => Self::RegularFile,
+            Self::Directory => Self::Directory,
+            Self::SymbolicLink => Self::SymbolicLink,
+            Self::RemoteObject => Self::RemoteObject,
+            Self::BlockDevice => Self::BlockDevice,
+            Self::CharacterDevice => Self::CharacterDevice,
+            Self::Fifo => Self::Fifo,
+            Self::Socket => Self::Socket,
+            Self::Other => Self::Other,
+            Self::Unknown => Self::Unknown,
+        }
     }
 }
 
 impl fmt::Debug for FileType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        formatter.write_str(self.debug_name())
     }
 }
 
 impl fmt::Display for FileType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        formatter.write_str(self.display_name())
     }
 }
 
 impl PartialEq for FileType {
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明 PartialEq 接口")
+        self.rank() == other.rank()
     }
 }
 
@@ -67,13 +126,13 @@ impl Eq for FileType {}
 
 impl PartialOrd for FileType {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for FileType {
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明 Ord 接口")
+        self.rank().cmp(&other.rank())
     }
 }
 
@@ -82,7 +141,7 @@ impl Hash for FileType {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明 Hash 接口")
+        self.rank().hash(state);
     }
 }
 
@@ -101,27 +160,48 @@ pub struct PortablePermissions {
     pub executable: Option<bool>,
 }
 
+fn permission_state(value: Option<bool>) -> &'static str {
+    match value {
+        None => "unknown",
+        Some(false) => "no",
+        Some(true) => "yes",
+    }
+}
+
 impl Clone for PortablePermissions {
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明 Clone 接口")
+        Self {
+            read_only: self.read_only,
+            executable: self.executable,
+        }
     }
 }
 
 impl fmt::Debug for PortablePermissions {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        formatter
+            .debug_struct("PortablePermissions")
+            .field("read_only", &self.read_only)
+            .field("executable", &self.executable)
+            .finish()
     }
 }
 
 impl fmt::Display for PortablePermissions {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        write!(
+            formatter,
+            "read-only: {}, executable: {}",
+            permission_state(self.read_only),
+            permission_state(self.executable)
+        )
     }
 }
 
 impl PartialEq for PortablePermissions {
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明 PartialEq 接口")
+        self.read_only == other.read_only
+            && self.executable == other.executable
     }
 }
 
@@ -129,13 +209,15 @@ impl Eq for PortablePermissions {}
 
 impl PartialOrd for PortablePermissions {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for PortablePermissions {
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明 Ord 接口")
+        self.read_only
+            .cmp(&other.read_only)
+            .then_with(|| self.executable.cmp(&other.executable))
     }
 }
 
@@ -144,7 +226,8 @@ impl Hash for PortablePermissions {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明 Hash 接口")
+        self.read_only.hash(state);
+        self.executable.hash(state);
     }
 }
 
@@ -170,27 +253,119 @@ pub struct FileTimes {
     pub metadata_changed: Option<SystemTime>,
 }
 
+struct FormattedSystemTime<'a>(Option<&'a SystemTime>);
+
+impl fmt::Debug for FormattedSystemTime<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for FormattedSystemTime<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Some(time) = self.0 else {
+            return formatter.write_str("unknown");
+        };
+
+        match time.duration_since(UNIX_EPOCH) {
+            Ok(duration) => {
+                if let Ok(seconds) = i64::try_from(duration.as_secs()) {
+                    if let Some(datetime) =
+                        DateTime::<Utc>::from_timestamp(seconds, duration.subsec_nanos())
+                    {
+                        return formatter.write_str(
+                            &datetime.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                        );
+                    }
+                }
+
+                write!(
+                    formatter,
+                    "unix+{}.{:09}s",
+                    duration.as_secs(),
+                    duration.subsec_nanos()
+                )
+            }
+            Err(error) => {
+                let magnitude = error.duration();
+                let nanoseconds = magnitude.subsec_nanos();
+                let signed_seconds = if nanoseconds == 0 {
+                    -i128::from(magnitude.as_secs())
+                } else {
+                    -i128::from(magnitude.as_secs()) - 1
+                };
+                let normalized_nanoseconds = if nanoseconds == 0 {
+                    0
+                } else {
+                    1_000_000_000 - nanoseconds
+                };
+
+                if let Ok(seconds) = i64::try_from(signed_seconds) {
+                    if let Some(datetime) =
+                        DateTime::<Utc>::from_timestamp(seconds, normalized_nanoseconds)
+                    {
+                        return formatter.write_str(
+                            &datetime.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                        );
+                    }
+                }
+
+                write!(
+                    formatter,
+                    "unix-{}.{:09}s",
+                    magnitude.as_secs(),
+                    magnitude.subsec_nanos()
+                )
+            }
+        }
+    }
+}
+
 impl Clone for FileTimes {
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明 Clone 接口")
+        Self {
+            created: self.created,
+            modified: self.modified,
+            accessed: self.accessed,
+            metadata_changed: self.metadata_changed,
+        }
     }
 }
 
 impl fmt::Debug for FileTimes {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        formatter
+            .debug_struct("FileTimes")
+            .field("created", &FormattedSystemTime(self.created.as_ref()))
+            .field("modified", &FormattedSystemTime(self.modified.as_ref()))
+            .field("accessed", &FormattedSystemTime(self.accessed.as_ref()))
+            .field(
+                "metadata_changed",
+                &FormattedSystemTime(self.metadata_changed.as_ref()),
+            )
+            .finish()
     }
 }
 
 impl fmt::Display for FileTimes {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        write!(
+            formatter,
+            "created: {}, modified: {}, accessed: {}, metadata changed: {}",
+            FormattedSystemTime(self.created.as_ref()),
+            FormattedSystemTime(self.modified.as_ref()),
+            FormattedSystemTime(self.accessed.as_ref()),
+            FormattedSystemTime(self.metadata_changed.as_ref())
+        )
     }
 }
 
 impl PartialEq for FileTimes {
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明 PartialEq 接口")
+        self.created == other.created
+            && self.modified == other.modified
+            && self.accessed == other.accessed
+            && self.metadata_changed == other.metadata_changed
     }
 }
 
@@ -198,13 +373,17 @@ impl Eq for FileTimes {}
 
 impl PartialOrd for FileTimes {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for FileTimes {
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明 Ord 接口")
+        self.created
+            .cmp(&other.created)
+            .then_with(|| self.modified.cmp(&other.modified))
+            .then_with(|| self.accessed.cmp(&other.accessed))
+            .then_with(|| self.metadata_changed.cmp(&other.metadata_changed))
     }
 }
 
@@ -213,7 +392,10 @@ impl Hash for FileTimes {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明 Hash 接口")
+        self.created.hash(state);
+        self.modified.hash(state);
+        self.accessed.hash(state);
+        self.metadata_changed.hash(state);
     }
 }
 
@@ -228,6 +410,10 @@ impl Hash for FileTimes {
 /// 相同 locator 与相同 token 只有在同一逻辑 namespace 实例及配置作用域内
 /// 才能解释为同一资源版本。本类型不是稳定文件身份；跨 namespace 复用是
 /// 非法调用，但不构成 Rust 未定义行为。
+///
+/// `Debug` 和 `Display` 只显示定位符与令牌字节数，不输出令牌内容；两种格式
+/// 都不是稳定序列化格式。排序先比较定位符，再按令牌原始字节排序，仅供集合
+/// 与确定性输出使用，不表示版本的新旧、因果或后端顺序。
 pub struct ResourceVersion<L> {
     locator: L,
     token: Arc<[u8]>,
@@ -240,13 +426,13 @@ impl<L> ResourceVersion<L> {
     /// `ResourceVersion` 放入元信息。没有可靠版本时应返回 `None`。
     #[must_use]
     pub fn new(locator: L, token: Arc<[u8]>) -> Self {
-        todo!("第一批次仅声明资源版本构造接口")
+        Self { locator, token }
     }
 
     /// 借用版本所属的资源位置。
     #[must_use]
     pub fn locator(&self) -> &L {
-        todo!("第一批次仅声明版本定位符访问接口")
+        &self.locator
     }
 
     /// 借用原始不透明版本令牌。
@@ -254,13 +440,13 @@ impl<L> ResourceVersion<L> {
     /// 返回值可能不是 UTF-8；调用方不得假定其可读、可排序或可安全记录。
     #[must_use]
     pub fn token(&self) -> &[u8] {
-        todo!("第一批次仅声明版本令牌访问接口")
+        &self.token
     }
 
     /// 消费版本值并取回定位符和共享令牌所有权。
     #[must_use]
     pub fn into_parts(self) -> (L, Arc<[u8]>) {
-        todo!("第一批次仅声明资源版本拆分接口")
+        (self.locator, self.token)
     }
 }
 
@@ -269,7 +455,10 @@ where
     L: Clone,
 {
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明 Clone 接口")
+        Self {
+            locator: self.locator.clone(),
+            token: Arc::clone(&self.token),
+        }
     }
 }
 
@@ -278,7 +467,11 @@ where
     L: fmt::Debug,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        formatter
+            .debug_struct("ResourceVersion")
+            .field("locator", &self.locator)
+            .field("token_len", &self.token.len())
+            .finish()
     }
 }
 
@@ -287,7 +480,12 @@ where
     L: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        write!(
+            formatter,
+            "{} (opaque version token: {} bytes)",
+            self.locator,
+            self.token.len()
+        )
     }
 }
 
@@ -296,7 +494,7 @@ where
     L: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明 PartialEq 接口")
+        self.locator == other.locator && self.token.as_ref() == other.token.as_ref()
     }
 }
 
@@ -307,7 +505,10 @@ where
     L: PartialOrd,
 {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明 PartialOrd 接口")
+        match self.locator.partial_cmp(&other.locator) {
+            Some(Ordering::Equal) => self.token.as_ref().partial_cmp(other.token.as_ref()),
+            ordering => ordering,
+        }
     }
 }
 
@@ -316,7 +517,9 @@ where
     L: Ord,
 {
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明 Ord 接口")
+        self.locator
+            .cmp(&other.locator)
+            .then_with(|| self.token.as_ref().cmp(other.token.as_ref()))
     }
 }
 
@@ -328,7 +531,8 @@ where
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明 Hash 接口")
+        self.locator.hash(state);
+        self.token.as_ref().hash(state);
     }
 }
 
@@ -337,6 +541,10 @@ where
 /// `L` 与产生该结果的 `FileNamespace::Locator` 相同。结构体不重复保存查询
 /// locator；只有版本令牌需要防止跨资源误用时，[`ResourceVersion`] 才拥有
 /// locator。重复查询可能观察到删除、替换或其它并发变化。
+///
+/// `Debug` 与 `Display` 保留未知字段的未知状态，并继承版本令牌的脱敏规则；
+/// 两种输出都不是稳定序列化格式。排序按公开字段声明顺序进行，仅供集合与
+/// 确定性输出使用，不表示对象种类、时间或版本之间的业务优先级。
 #[non_exhaustive]
 pub struct FileMetadata<L> {
     /// 查询实际观察到的对象种类。
@@ -367,7 +575,13 @@ impl<L> FileMetadata<L> {
         times: FileTimes,
         version: Option<ResourceVersion<L>>,
     ) -> Self {
-        todo!("第一批次仅声明文件元信息构造接口")
+        Self {
+            file_type,
+            byte_len,
+            permissions,
+            times,
+            version,
+        }
     }
 }
 
@@ -376,7 +590,13 @@ where
     L: Clone,
 {
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明 Clone 接口")
+        Self {
+            file_type: self.file_type.clone(),
+            byte_len: self.byte_len,
+            permissions: self.permissions.clone(),
+            times: self.times.clone(),
+            version: self.version.clone(),
+        }
     }
 }
 
@@ -385,7 +605,14 @@ where
     L: fmt::Debug,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        formatter
+            .debug_struct("FileMetadata")
+            .field("file_type", &self.file_type)
+            .field("byte_len", &self.byte_len)
+            .field("permissions", &self.permissions)
+            .field("times", &self.times)
+            .field("version", &self.version)
+            .finish()
     }
 }
 
@@ -394,7 +621,25 @@ where
     L: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        write!(
+            formatter,
+            "type: {}, byte length: ",
+            self.file_type
+        )?;
+        match self.byte_len {
+            Some(byte_len) => write!(formatter, "{byte_len} bytes")?,
+            None => formatter.write_str("unknown")?,
+        }
+        write!(
+            formatter,
+            ", permissions: {}, times: {}, version: ",
+            self.permissions,
+            self.times
+        )?;
+        match &self.version {
+            Some(version) => fmt::Display::fmt(version, formatter),
+            None => formatter.write_str("none"),
+        }
     }
 }
 
@@ -403,7 +648,11 @@ where
     L: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明 PartialEq 接口")
+        self.file_type == other.file_type
+            && self.byte_len == other.byte_len
+            && self.permissions == other.permissions
+            && self.times == other.times
+            && self.version == other.version
     }
 }
 
@@ -414,7 +663,16 @@ where
     L: PartialOrd,
 {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明 PartialOrd 接口")
+        let prefix_ordering = self
+            .file_type
+            .cmp(&other.file_type)
+            .then_with(|| self.byte_len.cmp(&other.byte_len))
+            .then_with(|| self.permissions.cmp(&other.permissions))
+            .then_with(|| self.times.cmp(&other.times));
+        match prefix_ordering {
+            Ordering::Equal => self.version.partial_cmp(&other.version),
+            ordering => Some(ordering),
+        }
     }
 }
 
@@ -423,7 +681,12 @@ where
     L: Ord,
 {
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明 Ord 接口")
+        self.file_type
+            .cmp(&other.file_type)
+            .then_with(|| self.byte_len.cmp(&other.byte_len))
+            .then_with(|| self.permissions.cmp(&other.permissions))
+            .then_with(|| self.times.cmp(&other.times))
+            .then_with(|| self.version.cmp(&other.version))
     }
 }
 
@@ -435,6 +698,10 @@ where
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明 Hash 接口")
+        self.file_type.hash(state);
+        self.byte_len.hash(state);
+        self.permissions.hash(state);
+        self.times.hash(state);
+        self.version.hash(state);
     }
 }

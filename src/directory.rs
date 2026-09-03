@@ -19,6 +19,12 @@ use crate::FileType;
 /// 改名、文件内容 I/O 或 MMAP。只有由合法 namespace 返回的值才具有“单个
 /// 直接子项”的生产者保证；生产者必须排除 `.`、`..`、路径分隔符和虚拟
 /// 目录逃逸。
+///
+/// # 跨线程安全前置条件
+///
+/// 包含 [`Self::Remote`] 的值只有在最终依赖图未为 `pi_atom` 使用的同一份
+/// `pi_share` 启用 `rc` feature 时，才位于本 crate 支持的跨线程安全域。完整
+/// 审计义务见 crate 级文档的“跨线程安全的依赖图前置条件”章节。
 #[non_exhaustive]
 pub enum EntryName {
     /// 操作系统原生目录项名称。
@@ -28,31 +34,51 @@ pub enum EntryName {
 
     /// 远端后端提供的 UTF-8 逻辑子项名称。
     ///
-    /// 该值不是远端对象的完整 key。
+    /// 该值不是远端对象的完整 key；其跨线程使用继承 [`EntryName`] 的最终依赖
+    /// 图前置条件。
     Remote(Atom),
 }
 
 impl Clone for EntryName {
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明 Clone 接口")
+        match self {
+            Self::Native(name) => Self::Native(name.clone()),
+            Self::Remote(name) => Self::Remote(name.clone()),
+        }
     }
 }
 
 impl fmt::Debug for EntryName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        match self {
+            Self::Native(name) => formatter
+                .debug_tuple("Native")
+                .field(name)
+                .finish(),
+            Self::Remote(name) => formatter
+                .debug_tuple("Remote")
+                .field(&name.as_str())
+                .finish(),
+        }
     }
 }
 
 impl fmt::Display for EntryName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        match self {
+            Self::Native(name) => formatter.write_str(&name.to_string_lossy()),
+            Self::Remote(name) => formatter.write_str(name.as_str()),
+        }
     }
 }
 
 impl PartialEq for EntryName {
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明 PartialEq 接口")
+        match (self, other) {
+            (Self::Native(left), Self::Native(right)) => left == right,
+            (Self::Remote(left), Self::Remote(right)) => left == right,
+            _ => false,
+        }
     }
 }
 
@@ -60,13 +86,18 @@ impl Eq for EntryName {}
 
 impl PartialOrd for EntryName {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for EntryName {
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明 Ord 接口")
+        match (self, other) {
+            (Self::Native(left), Self::Native(right)) => left.cmp(right),
+            (Self::Native(_), Self::Remote(_)) => Ordering::Less,
+            (Self::Remote(_), Self::Native(_)) => Ordering::Greater,
+            (Self::Remote(left), Self::Remote(right)) => left.cmp(right),
+        }
     }
 }
 
@@ -75,25 +106,34 @@ impl Hash for EntryName {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明 Hash 接口")
+        match self {
+            Self::Native(name) => {
+                0_u8.hash(state);
+                name.hash(state);
+            }
+            Self::Remote(name) => {
+                1_u8.hash(state);
+                name.hash(state);
+            }
+        }
     }
 }
 
 impl From<OsString> for EntryName {
     fn from(name: OsString) -> Self {
-        todo!("第一批次仅声明 From<OsString> 接口")
+        Self::Native(name)
     }
 }
 
 impl From<&OsStr> for EntryName {
     fn from(name: &OsStr) -> Self {
-        todo!("第一批次仅声明 From<&OsStr> 接口")
+        Self::Native(name.to_os_string())
     }
 }
 
 impl From<Atom> for EntryName {
     fn from(name: Atom) -> Self {
-        todo!("第一批次仅声明 From<Atom> 接口")
+        Self::Remote(name)
     }
 }
 
@@ -101,7 +141,8 @@ impl From<Atom> for EntryName {
 ///
 /// `L` 通常是产生该结果的 `FileNamespace::Locator`。调用方可以把 `locator`
 /// 显式交回同一个逻辑 namespace 执行后续操作，但不能把本值当作已打开
-/// 文件、稳定文件身份或能够自行访问后端的活动对象。
+/// 文件、稳定文件身份或能够自行访问后端的活动对象。包含远端 [`EntryName`]
+/// 时，本值继承其跨线程安全依赖图前置条件。
 #[non_exhaustive]
 pub struct DirectoryEntry<L> {
     /// 相对于被枚举目录的单个直接子项名称。
@@ -122,7 +163,11 @@ impl<L> DirectoryEntry<L> {
     /// 枚举的同一个直接子项；`file_type_hint` 只能表示枚举时已经获知的提示。
     #[must_use]
     pub fn new(name: EntryName, locator: L, file_type_hint: Option<FileType>) -> Self {
-        todo!("第一批次仅声明目录项构造接口")
+        Self {
+            name,
+            locator,
+            file_type_hint,
+        }
     }
 }
 
@@ -131,7 +176,11 @@ where
     L: Clone,
 {
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明 Clone 接口")
+        Self::new(
+            self.name.clone(),
+            self.locator.clone(),
+            self.file_type_hint.clone(),
+        )
     }
 }
 
@@ -140,7 +189,12 @@ where
     L: fmt::Debug,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        formatter
+            .debug_struct("DirectoryEntry")
+            .field("name", &self.name)
+            .field("locator", &self.locator)
+            .field("file_type_hint", &self.file_type_hint)
+            .finish()
     }
 }
 
@@ -149,7 +203,11 @@ where
     L: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        write!(formatter, "{} at {}", self.name, self.locator)?;
+        match &self.file_type_hint {
+            Some(file_type) => write!(formatter, ", type hint: {file_type}"),
+            None => formatter.write_str(", type hint: unavailable"),
+        }
     }
 }
 
@@ -158,7 +216,9 @@ where
     L: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明 PartialEq 接口")
+        self.name == other.name
+            && self.locator == other.locator
+            && self.file_type_hint == other.file_type_hint
     }
 }
 
@@ -169,7 +229,14 @@ where
     L: PartialOrd,
 {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明 PartialOrd 接口")
+        match self.name.cmp(&other.name) {
+            Ordering::Equal => {}
+            ordering => return Some(ordering),
+        }
+        match self.locator.partial_cmp(&other.locator)? {
+            Ordering::Equal => self.file_type_hint.partial_cmp(&other.file_type_hint),
+            ordering => Some(ordering),
+        }
     }
 }
 
@@ -178,7 +245,10 @@ where
     L: Ord,
 {
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明 Ord 接口")
+        self.name
+            .cmp(&other.name)
+            .then_with(|| self.locator.cmp(&other.locator))
+            .then_with(|| self.file_type_hint.cmp(&other.file_type_hint))
     }
 }
 
@@ -190,6 +260,8 @@ where
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明 Hash 接口")
+        self.name.hash(state);
+        self.locator.hash(state);
+        self.file_type_hint.hash(state);
     }
 }

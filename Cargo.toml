@@ -9,10 +9,33 @@ keywords = ["async", "filesystem", "io", "runtime-agnostic"]
 categories = ["asynchronous", "filesystem"]
 
 [dependencies]
+async-lock = "3.4.2"
+async-fs = "2.2.0"
+async-global-executor = "3.1.0"
+async-stream = "0.3.6"
+blocking = "1.7.0"
 bytes = "1.12.1"
+cap-fs-ext = { version = "4.0.3", default-features = false, features = ["std"] }
+cap-std = { version = "4.0.3", default-features = false }
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 futures-core = "0.3"
+futures-lite = "2.6.1"
+fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
+memmap2 = "0.9.11"
 pi_atom = "0.7.0"
-pi_result = { version = "0.1.0", path = "../pi_result" }
+pi_result = { version = "0.1.1", path = "../pi_result" }
+sha2 = { version = "0.11.0", default-features = false }
 thiserror = "2.0.20"
 url = "2.5.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_SystemServices"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

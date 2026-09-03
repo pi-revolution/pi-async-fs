@@ -161,24 +161,59 @@ pub enum FileAccessMode {
     Truncate,
 }
 
+impl FileAccessMode {
+    fn rank(&self) -> u8 {
+        match self {
+            Self::Read => 0,
+            Self::Append => 1,
+            Self::Overwrite => 2,
+            Self::ReadMmap => 3,
+            Self::ReadWriteMmap => 4,
+            Self::Truncate => 5,
+        }
+    }
+
+    fn debug_name(&self) -> &'static str {
+        match self {
+            Self::Read => "Read",
+            Self::Append => "Append",
+            Self::Overwrite => "Overwrite",
+            Self::ReadMmap => "ReadMmap",
+            Self::ReadWriteMmap => "ReadWriteMmap",
+            Self::Truncate => "Truncate",
+        }
+    }
+
+    fn display_name(&self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Append => "append",
+            Self::Overwrite => "overwrite",
+            Self::ReadMmap => "read-mmap",
+            Self::ReadWriteMmap => "read-write-mmap",
+            Self::Truncate => "truncate",
+        }
+    }
+}
+
 impl fmt::Debug for FileAccessMode {
     // 以 Rust 变体名显示资源角色，不查询文件或后端状态。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明文件访问角色 Debug 接口")
+        formatter.write_str(self.debug_name())
     }
 }
 
 impl fmt::Display for FileAccessMode {
     // 输出稳定的人类可读角色标签，不承诺可反向解析或跨版本序列化。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明文件访问角色 Display 接口")
+        formatter.write_str(self.display_name())
     }
 }
 
 impl PartialEq for FileAccessMode {
     // 仅在两个值表示相同资源角色时判等。
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明文件访问角色 PartialEq 接口")
+        self.rank() == other.rank()
     }
 }
 
@@ -187,14 +222,14 @@ impl Eq for FileAccessMode {}
 impl PartialOrd for FileAccessMode {
     // 返回与 [`Ord`] 一致的角色标签全序。
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明文件访问角色 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for FileAccessMode {
     // 按声明顺序比较角色标签，不表达权限包含或安全强度关系。
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明文件访问角色 Ord 接口")
+        self.rank().cmp(&other.rank())
     }
 }
 
@@ -204,6 +239,6 @@ impl Hash for FileAccessMode {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明文件访问角色 Hash 接口")
+        self.rank().hash(state);
     }
 }

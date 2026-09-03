@@ -48,7 +48,7 @@ pub enum MmapRangeError {
 
 impl ClassifyErrorKind for MmapRangeError {
     fn classify_error_kind(&self) -> ErrorKind {
-        todo!("第一批次仅声明错误分类接口")
+        ErrorKind::InvalidInput
     }
 }
 
@@ -90,21 +90,31 @@ impl MmapRange {
     // 查询文件长度、分配内存、接触全局协调状态或执行 I/O，也不会 panic。
     /// 从端点构造非空半开范围 `[start, end_exclusive)`。
     pub fn new(start: u64, end_exclusive: u64) -> RawResult<Self, MmapRangeError> {
-        todo!("第一批次仅声明内存映射逻辑范围构造接口")
+        match start.cmp(&end_exclusive) {
+            Ordering::Less => Ok(Self {
+                start,
+                end_exclusive,
+            }),
+            Ordering::Equal => Err(MmapRangeError::Empty { at: start }),
+            Ordering::Greater => Err(MmapRangeError::Reversed {
+                start,
+                end_exclusive,
+            }),
+        }
     }
 
     // 返回范围中包含的第一个文件字节偏移。
     #[must_use]
     /// 返回范围包含的第一个文件字节偏移。
     pub fn start(&self) -> u64 {
-        todo!("第一批次仅声明内存映射逻辑范围起点访问接口")
+        self.start
     }
 
     // 返回范围中不包含的文件字节终点。
     #[must_use]
     /// 返回范围不包含的文件字节终点。
     pub fn end_exclusive(&self) -> u64 {
-        todo!("第一批次仅声明内存映射逻辑范围终点访问接口")
+        self.end_exclusive
     }
 
     // 返回范围包含的字节数。
@@ -113,26 +123,31 @@ impl MmapRange {
     // 不表示当前进程必然可以把该长度转换为 `usize` 或一次完成映射。
     #[must_use]
     /// 返回范围包含的非零字节数。
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> u64 {
-        todo!("第一批次仅声明内存映射逻辑范围长度访问接口")
+        self.end_exclusive - self.start
     }
 }
 
 impl fmt::Debug for MmapRange {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        formatter
+            .debug_struct("MmapRange")
+            .field("start", &self.start)
+            .field("end_exclusive", &self.end_exclusive)
+            .finish()
     }
 }
 
 impl fmt::Display for MmapRange {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        write!(formatter, "[{}, {})", self.start, self.end_exclusive)
     }
 }
 
 impl PartialEq for MmapRange {
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明 PartialEq 接口")
+        self.start == other.start && self.end_exclusive == other.end_exclusive
     }
 }
 
@@ -140,13 +155,15 @@ impl Eq for MmapRange {}
 
 impl PartialOrd for MmapRange {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for MmapRange {
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明 Ord 接口")
+        self.start
+            .cmp(&other.start)
+            .then_with(|| self.end_exclusive.cmp(&other.end_exclusive))
     }
 }
 
@@ -155,7 +172,8 @@ impl Hash for MmapRange {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明 Hash 接口")
+        self.start.hash(state);
+        self.end_exclusive.hash(state);
     }
 }
 
@@ -163,6 +181,6 @@ impl TryFrom<Range<u64>> for MmapRange {
     type Error = MmapRangeError;
 
     fn try_from(range: Range<u64>) -> Result<Self, Self::Error> {
-        todo!("第一批次仅声明 TryFrom<Range<u64>> 接口")
+        Self::new(range.start, range.end)
     }
 }

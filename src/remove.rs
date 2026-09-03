@@ -91,21 +91,38 @@ pub enum RemoveTargetEvidence {
 impl fmt::Debug for RemoveTargetEvidence {
     // 以 Rust 变体名称显示证据，不查询 locator 或底层对象。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明移除目标证据 Debug 接口")
+        formatter.write_str(match self {
+            Self::NotRemovedByOperation => "NotRemovedByOperation",
+            Self::RemovedByOperation => "RemovedByOperation",
+            Self::Unknown => "Unknown",
+        })
     }
 }
 
 impl fmt::Display for RemoveTargetEvidence {
     // 输出面向日志的人类可读证据摘要，不承诺可反向解析。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明移除目标证据 Display 接口")
+        formatter.write_str(match self {
+            Self::NotRemovedByOperation => "target not removed by operation",
+            Self::RemovedByOperation => "target removed by operation",
+            Self::Unknown => "target removal outcome unknown",
+        })
     }
 }
 
 impl PartialEq for RemoveTargetEvidence {
     // 仅在两个值表示相同证据标签时判等。
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明移除目标证据 PartialEq 接口")
+        matches!(
+            (self, other),
+            (
+                Self::NotRemovedByOperation,
+                Self::NotRemovedByOperation
+            ) | (
+                Self::RemovedByOperation,
+                Self::RemovedByOperation
+            ) | (Self::Unknown, Self::Unknown)
+        )
     }
 }
 
@@ -114,14 +131,22 @@ impl Eq for RemoveTargetEvidence {}
 impl PartialOrd for RemoveTargetEvidence {
     // 返回与 [`Ord`] 一致的证据标签全序。
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明移除目标证据 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for RemoveTargetEvidence {
     // 按变体声明顺序比较，不表达证据强度或恢复优先级。
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明移除目标证据 Ord 接口")
+        fn rank(evidence: &RemoveTargetEvidence) -> u8 {
+            match evidence {
+                RemoveTargetEvidence::NotRemovedByOperation => 0,
+                RemoveTargetEvidence::RemovedByOperation => 1,
+                RemoveTargetEvidence::Unknown => 2,
+            }
+        }
+
+        rank(self).cmp(&rank(other))
     }
 }
 
@@ -131,7 +156,12 @@ impl Hash for RemoveTargetEvidence {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明移除目标证据 Hash 接口")
+        let discriminant = match self {
+            Self::NotRemovedByOperation => 0_u8,
+            Self::RemovedByOperation => 1_u8,
+            Self::Unknown => 2_u8,
+        };
+        discriminant.hash(state);
     }
 }
 
@@ -211,7 +241,10 @@ impl RemoveFailure {
     #[must_use]
     /// 按“错误、目标证据”的顺序构造失败值。
     pub fn new(error: Error, target_evidence: RemoveTargetEvidence) -> Self {
-        todo!("第一批次仅声明移除失败载体构造接口")
+        Self {
+            error,
+            target_evidence,
+        }
     }
 
     // 共享借用单目标移除失败的统一诊断报告。
@@ -241,7 +274,7 @@ impl RemoveFailure {
     #[must_use]
     /// 返回失败诊断的共享引用。
     pub fn error(&self) -> &Error {
-        todo!("第一批次仅声明移除失败诊断访问接口")
+        &self.error
     }
 
     // 共享借用本次单目标操作记录的移除提交证据。
@@ -272,7 +305,7 @@ impl RemoveFailure {
     #[must_use]
     /// 返回目标移除证据的共享引用。
     pub fn target_evidence(&self) -> &RemoveTargetEvidence {
-        todo!("第一批次仅声明移除目标证据访问接口")
+        &self.target_evidence
     }
 
     // 消费失败载体并一次性取回诊断报告与移除提交证据。
@@ -301,20 +334,28 @@ impl RemoveFailure {
     #[must_use]
     /// 消费失败值并按构造顺序返回全部字段。
     pub fn into_parts(self) -> (Error, RemoveTargetEvidence) {
-        todo!("第一批次仅声明移除失败载体拆解接口")
+        (self.error, self.target_evidence)
     }
 }
 
 impl fmt::Debug for RemoveFailure {
     // 显示统一诊断与移除证据，不查询或修改 namespace 目标。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明移除失败载体 Debug 接口")
+        formatter
+            .debug_struct("RemoveFailure")
+            .field("error", &self.error)
+            .field("target_evidence", &self.target_evidence)
+            .finish()
     }
 }
 
 impl fmt::Display for RemoveFailure {
     // 输出面向日志的脱敏失败摘要，不承诺稳定文本协议。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明移除失败载体 Display 接口")
+        write!(
+            formatter,
+            "{}; target: {}",
+            self.error, self.target_evidence
+        )
     }
 }

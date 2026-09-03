@@ -1,8 +1,8 @@
 // 本地文件跨进程协调的全局放置策略与授权令牌。
 //
-// 本模块只声明跨进程协调的公共 interface，不实现文件锁、范围租约、
-// 稳定文件身份核验或协调目录管理。第一批次中的函数和 trait 方法均使用
-// `todo!()` 占位；调用这些占位接口会 panic。
+// 本模块定义跨进程协调的公共配置与不透明授权载体；标准本地适配器的协议、
+// 文件身份核验和资源准入实现位于私有本地模块。远端适配器不会自动继承
+// 本地文件系统的协调能力。
 //
 // 跨进程协调使用目标文件以外的专属协调目录保存锁文件、协议版本和范围
 // 租约记录。默认策略把协调目录放在目标文件的父目录；应用也可以在首次
@@ -21,6 +21,7 @@ use core::cmp::Ordering;
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 // 当前进程中所有本地跨进程协调目录的根位置策略。
 //
@@ -96,31 +97,48 @@ pub enum CrossProcessCoordinationRoot {
     Custom(PathBuf),
 }
 
+// 默认策略是冻结的公开语义；保留显式实现和就地说明，不让派生写法隐藏它。
+#[allow(clippy::derivable_impls)]
 impl Default for CrossProcessCoordinationRoot {
     // 返回 [`CrossProcessCoordinationRoot::FileParent`] 默认策略。
     fn default() -> Self {
-        todo!("第一批次仅声明跨进程协调根目录默认值接口")
+        Self::FileParent
     }
 }
 
 impl fmt::Debug for CrossProcessCoordinationRoot {
     // 显示策略变体以及自定义根目录的调试表示，不访问文件系统。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明跨进程协调根目录 Debug 接口")
+        match self {
+            Self::FileParent => formatter.write_str("FileParent"),
+            Self::Custom(path) => formatter
+                .debug_tuple("Custom")
+                .field(path)
+                .finish(),
+        }
     }
 }
 
 impl fmt::Display for CrossProcessCoordinationRoot {
     // 显示供人阅读的放置策略，不把输出承诺为可反向解析的配置格式。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明跨进程协调根目录 Display 接口")
+        match self {
+            Self::FileParent => formatter.write_str("target file parent"),
+            Self::Custom(path) => {
+                write!(formatter, "custom root: {}", path.display())
+            }
+        }
     }
 }
 
 impl PartialEq for CrossProcessCoordinationRoot {
     // 按策略变体和 `PathBuf` 的原始平台表示判等，不解析物理目录身份。
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明跨进程协调根目录 PartialEq 接口")
+        match (self, other) {
+            (Self::FileParent, Self::FileParent) => true,
+            (Self::Custom(left), Self::Custom(right)) => left == right,
+            _ => false,
+        }
     }
 }
 
@@ -129,14 +147,19 @@ impl Eq for CrossProcessCoordinationRoot {}
 impl PartialOrd for CrossProcessCoordinationRoot {
     // 返回与 [`Ord`] 一致的配置表示全序。
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明跨进程协调根目录 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for CrossProcessCoordinationRoot {
     // 仅为确定性诊断和容器索引比较配置表示，不表达策略优先级。
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明跨进程协调根目录 Ord 接口")
+        match (self, other) {
+            (Self::FileParent, Self::FileParent) => Ordering::Equal,
+            (Self::FileParent, Self::Custom(_)) => Ordering::Less,
+            (Self::Custom(_), Self::FileParent) => Ordering::Greater,
+            (Self::Custom(left), Self::Custom(right)) => left.cmp(right),
+        }
     }
 }
 
@@ -146,7 +169,13 @@ impl Hash for CrossProcessCoordinationRoot {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明跨进程协调根目录 Hash 接口")
+        match self {
+            Self::FileParent => 0_u8.hash(state),
+            Self::Custom(path) => {
+                1_u8.hash(state);
+                path.hash(state);
+            }
+        }
     }
 }
 
@@ -215,7 +244,38 @@ impl Hash for CrossProcessCoordinationRoot {
 pub fn set_cross_process_coordination_root(
     root: CrossProcessCoordinationRoot,
 ) -> pi_result::Result<()> {
-    todo!("第一批次仅声明跨进程协调根目录全局设置接口")
+    if let CrossProcessCoordinationRoot::Custom(path) = &root {
+        if path.as_os_str().is_empty() || !path.is_absolute() {
+            return Err(pi_result::error_stack::Report::new(
+                pi_result::ErrorKind::InvalidInput,
+            ));
+        }
+    }
+
+    match CROSS_PROCESS_COORDINATION_ROOT.set(root) {
+        Ok(()) => Ok(()),
+        Err(rejected) if CROSS_PROCESS_COORDINATION_ROOT.get() == Some(&rejected) => {
+            Ok(())
+        }
+        Err(_) => Err(pi_result::error_stack::Report::new(
+            pi_result::ErrorKind::Conflict,
+        )),
+    }
+}
+
+static CROSS_PROCESS_COORDINATION_ROOT: OnceLock<
+    CrossProcessCoordinationRoot,
+> = OnceLock::new();
+
+pub(crate) fn frozen_cross_process_coordination_root(
+) -> &'static CrossProcessCoordinationRoot {
+    CROSS_PROCESS_COORDINATION_ROOT
+        .get_or_init(CrossProcessCoordinationRoot::default)
+}
+
+pub(crate) fn configured_cross_process_coordination_root(
+) -> Option<&'static CrossProcessCoordinationRoot> {
+    CROSS_PROCESS_COORDINATION_ROOT.get()
 }
 
 // 绑定到单个稳定本地文件身份的跨进程协调授权令牌。
@@ -299,24 +359,47 @@ pub fn set_cross_process_coordination_root(
 /// 可以先于由它打开的文件资源释放，不会使既有资源失效。
 ///
 /// 该值本身不算活动文件资源，也不会单独阻止协调式删除。其安全保证依赖
-/// 建立授权的 `unsafe` 前提持续成立：所有相关进程均合作，且协调位置可信。
+/// 建立授权的 `unsafe` 前提持续成立：所有相关进程均合作，协调位置可信，
+/// 并且同一物理目标在所有合作进程中始终使用相同的物理父目录和原生末级
+/// 文件名。不同硬链接名不能作为同一协调目标交替使用。
 pub struct CrossProcessFileAuthority {
-    // 第一批次只固定不透明公共外形。批次二会把该字段替换为拥有稳定身份值、
-    // 目标实例代次、已解析全局根目录和 sidecar 协调状态的私有引用计数核心；
-    // 该核心不得永久持有目标文件的原生句柄。
-    _private: (),
+    pub(crate) core: Arc<crate::local::CrossProcessAuthorityCore>,
+}
+
+impl CrossProcessFileAuthority {
+    pub(crate) fn from_local_core(
+        core: Arc<crate::local::CrossProcessAuthorityCore>,
+    ) -> Self {
+        Self { core }
+    }
+
+    pub(crate) fn local_core(
+        &self,
+    ) -> &Arc<crate::local::CrossProcessAuthorityCore> {
+        &self.core
+    }
 }
 
 impl fmt::Debug for CrossProcessFileAuthority {
     // 显示脱敏后的后端、协议版本和诊断编号，不泄漏底层锁句柄。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明跨进程文件协调授权 Debug 接口")
+        formatter
+            .debug_struct("CrossProcessFileAuthority")
+            .field("backend", &"local")
+            .field("protocol_version", &self.core.protocol_version())
+            .field("diagnostic_id", &self.core.diagnostic_id())
+            .finish_non_exhaustive()
     }
 }
 
 impl fmt::Display for CrossProcessFileAuthority {
     // 显示供人阅读的不透明授权摘要，不作为文件身份或序列化格式。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明跨进程文件协调授权 Display 接口")
+        write!(
+            formatter,
+            "local cross-process file authority #{} (protocol v{})",
+            self.core.diagnostic_id(),
+            self.core.protocol_version(),
+        )
     }
 }

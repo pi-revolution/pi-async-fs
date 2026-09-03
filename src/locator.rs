@@ -53,7 +53,7 @@ pub enum RemoteLocatorError {
 
 impl ClassifyErrorKind for RemoteLocatorError {
     fn classify_error_kind(&self) -> ErrorKind {
-        todo!("第一批次仅声明错误分类接口")
+        todo!("第三批次实现远端定位符错误分类")
     }
 }
 
@@ -80,7 +80,7 @@ impl RemoteLocator {
     /// 校验只处理与具体后端无关的 URL 结构和敏感信息约束，不连接网络、
     /// 不查询远端服务，也不证明目标存在。失败前不得产生外部副作用。
     pub fn new(url: Url) -> RawResult<Self, RemoteLocatorError> {
-        todo!("第一批次仅声明远端定位符构造接口")
+        todo!("第三批次实现远端定位符构造接口")
     }
 
     /// 借用该定位符的规范化 URL。
@@ -89,7 +89,7 @@ impl RemoteLocator {
     /// 修改 URL 的能力。
     #[must_use]
     pub fn as_url(&self) -> &Url {
-        todo!("第一批次仅声明远端 URL 访问接口")
+        todo!("第三批次实现远端 URL 访问接口")
     }
 
     /// 借用规范化 URL 的字符串表示。
@@ -98,7 +98,7 @@ impl RemoteLocator {
     /// 验证。该方法不分配。
     #[must_use]
     pub fn as_str(&self) -> &str {
-        todo!("第一批次仅声明远端 URL 文本访问接口")
+        todo!("第三批次实现远端 URL 文本访问接口")
     }
 
     /// 消费定位符并取回其 [`Url`] 所有权。
@@ -106,45 +106,47 @@ impl RemoteLocator {
     /// 该操作不执行 I/O；调用后原 `RemoteLocator` 被移动，不能继续使用。
     #[must_use]
     pub fn into_url(self) -> Url {
-        todo!("第一批次仅声明远端 URL 所有权提取接口")
+        todo!("第三批次实现远端 URL 所有权提取接口")
     }
 }
 
 impl Clone for RemoteLocator {
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明 Clone 接口")
+        todo!("第三批次实现远端定位符 Clone 接口")
     }
 }
 
 impl fmt::Debug for RemoteLocator {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        todo!("第三批次实现远端定位符 Debug 接口")
     }
 }
 
 impl fmt::Display for RemoteLocator {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        todo!("第三批次实现远端定位符 Display 接口")
     }
 }
 
 impl PartialEq for RemoteLocator {
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明 PartialEq 接口")
+        todo!("第三批次实现远端定位符 PartialEq 接口")
     }
 }
 
 impl Eq for RemoteLocator {}
 
+// 第三批次占位必须继续使用 `todo!()`，届时 PartialOrd 与 Ord 将一并实现。
+#[allow(clippy::non_canonical_partial_ord_impl)]
 impl PartialOrd for RemoteLocator {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明 PartialOrd 接口")
+        todo!("第三批次实现远端定位符 PartialOrd 接口")
     }
 }
 
 impl Ord for RemoteLocator {
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明 Ord 接口")
+        todo!("第三批次实现远端定位符 Ord 接口")
     }
 }
 
@@ -153,19 +155,19 @@ impl Hash for RemoteLocator {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明 Hash 接口")
+        todo!("第三批次实现远端定位符 Hash 接口")
     }
 }
 
 impl AsRef<Url> for RemoteLocator {
     fn as_ref(&self) -> &Url {
-        todo!("第一批次仅声明 AsRef 接口")
+        todo!("第三批次实现远端定位符 AsRef 接口")
     }
 }
 
 impl Borrow<Url> for RemoteLocator {
     fn borrow(&self) -> &Url {
-        todo!("第一批次仅声明 Borrow 接口")
+        todo!("第三批次实现远端定位符 Borrow 接口")
     }
 }
 
@@ -173,7 +175,7 @@ impl TryFrom<Url> for RemoteLocator {
     type Error = RemoteLocatorError;
 
     fn try_from(url: Url) -> Result<Self, Self::Error> {
-        todo!("第一批次仅声明 TryFrom<Url> 接口")
+        todo!("第三批次实现远端定位符 TryFrom<Url> 接口")
     }
 }
 
@@ -181,13 +183,13 @@ impl FromStr for RemoteLocator {
     type Err = RemoteLocatorError;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        todo!("第一批次仅声明 FromStr 接口")
+        todo!("第三批次实现远端定位符 FromStr 接口")
     }
 }
 
 impl From<RemoteLocator> for Url {
     fn from(locator: RemoteLocator) -> Self {
-        todo!("第一批次仅声明 From<RemoteLocator> 接口")
+        todo!("第三批次实现远端定位符所有权转换")
     }
 }
 
@@ -198,7 +200,7 @@ impl From<RemoteLocator> for Url {
 /// 直接使用 [`RemoteLocator`]；它们不必接受与自身无关的枚举分支。
 ///
 /// `FileLocator` 只描述位置，不表示后端身份、权限凭据、已打开句柄、稳定
-/// 文件身份或 MMAP 协调键。第一批次不通过该类型动态路由任意未知后端。
+/// 文件身份或 MMAP 协调键。当前 API 不通过该类型动态路由任意未知后端。
 #[non_exhaustive]
 pub enum FileLocator {
     /// 由当前操作系统路径命名空间解释的位置。
@@ -213,39 +215,41 @@ pub enum FileLocator {
 
 impl Clone for FileLocator {
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明 Clone 接口")
+        todo!("第三批次实现组合定位符 Clone 接口")
     }
 }
 
 impl fmt::Debug for FileLocator {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        todo!("第三批次实现组合定位符 Debug 接口")
     }
 }
 
 impl fmt::Display for FileLocator {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        todo!("第三批次实现组合定位符 Display 接口")
     }
 }
 
 impl PartialEq for FileLocator {
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明 PartialEq 接口")
+        todo!("第三批次实现组合定位符 PartialEq 接口")
     }
 }
 
 impl Eq for FileLocator {}
 
+// 第三批次占位必须继续使用 `todo!()`，届时 PartialOrd 与 Ord 将一并实现。
+#[allow(clippy::non_canonical_partial_ord_impl)]
 impl PartialOrd for FileLocator {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明 PartialOrd 接口")
+        todo!("第三批次实现组合定位符 PartialOrd 接口")
     }
 }
 
 impl Ord for FileLocator {
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明 Ord 接口")
+        todo!("第三批次实现组合定位符 Ord 接口")
     }
 }
 
@@ -254,25 +258,25 @@ impl Hash for FileLocator {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明 Hash 接口")
+        todo!("第三批次实现组合定位符 Hash 接口")
     }
 }
 
 impl From<PathBuf> for FileLocator {
     fn from(path: PathBuf) -> Self {
-        todo!("第一批次仅声明 From<PathBuf> 接口")
+        todo!("第三批次实现组合定位符 From<PathBuf> 接口")
     }
 }
 
 impl From<&Path> for FileLocator {
     fn from(path: &Path) -> Self {
-        todo!("第一批次仅声明 From<&Path> 接口")
+        todo!("第三批次实现组合定位符 From<&Path> 接口")
     }
 }
 
 impl From<RemoteLocator> for FileLocator {
     fn from(locator: RemoteLocator) -> Self {
-        todo!("第一批次仅声明 From<RemoteLocator> 接口")
+        todo!("第三批次实现组合定位符 From<RemoteLocator> 接口")
     }
 }
 
@@ -280,6 +284,6 @@ impl TryFrom<Url> for FileLocator {
     type Error = RemoteLocatorError;
 
     fn try_from(url: Url) -> Result<Self, Self::Error> {
-        todo!("第一批次仅声明 TryFrom<Url> 接口")
+        todo!("第三批次实现组合定位符 TryFrom<Url> 接口")
     }
 }

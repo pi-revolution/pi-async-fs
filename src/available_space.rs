@@ -4,8 +4,7 @@
 // Windows 调用身份配额、Linux 非特权可用块和远端容量接口误写成完全相同的
 // 物理磁盘概念，也不把文件系统总空闲量、总容量或浏览器估计混进同一个值。
 //
-// 本模块在第一批次只声明值类型及其基础接口；所有方法体使用 `todo!()`，
-// 不执行平台查询或其它 I/O。
+// 本模块只承载无 I/O 的值语义；定位符解析和平台查询由 namespace 实现负责。
 
 use core::cmp::Ordering;
 use core::fmt;
@@ -88,7 +87,7 @@ impl AvailableSpace {
     #[must_use]
     /// 从已经符合本类型语义的候选可用字节数构造快照。
     pub fn new(available_bytes: u64) -> Self {
-        todo!("第一批次仅声明可用空间快照构造接口")
+        Self { available_bytes }
     }
 
     // 返回本次快照中的候选可用字节数。
@@ -98,35 +97,38 @@ impl AvailableSpace {
     #[must_use]
     /// 返回快照中的候选可用字节数。
     pub fn available_bytes(&self) -> u64 {
-        todo!("第一批次仅声明可用空间字节访问接口")
+        self.available_bytes
     }
 }
 
 impl Clone for AvailableSpace {
     // 复制同一个数值快照，不重新查询后端，也不产生新的空间保证。
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明可用空间快照 Clone 接口")
+        Self::new(self.available_bytes)
     }
 }
 
 impl fmt::Debug for AvailableSpace {
     // 显示字段名和明确字节单位，不查询后端。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明可用空间快照 Debug 接口")
+        formatter
+            .debug_struct("AvailableSpace")
+            .field("available_bytes", &self.available_bytes)
+            .finish()
     }
 }
 
 impl fmt::Display for AvailableSpace {
     // 显示供人阅读的可用字节数，不作为稳定机器格式。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明可用空间快照 Display 接口")
+        write!(formatter, "{} bytes available", self.available_bytes)
     }
 }
 
 impl PartialEq for AvailableSpace {
     // 只比较候选可用字节数，不比较来源作用域或查询时刻。
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明可用空间快照 PartialEq 接口")
+        self.available_bytes == other.available_bytes
     }
 }
 
@@ -135,14 +137,14 @@ impl Eq for AvailableSpace {}
 impl PartialOrd for AvailableSpace {
     // 返回与 [`Ord`] 一致的候选可用字节数全序。
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明可用空间快照 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for AvailableSpace {
     // 按候选可用字节数从小到大排序，不表达来源质量或新鲜度。
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明可用空间快照 Ord 接口")
+        self.available_bytes.cmp(&other.available_bytes)
     }
 }
 
@@ -152,6 +154,6 @@ impl Hash for AvailableSpace {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明可用空间快照 Hash 接口")
+        self.available_bytes.hash(state);
     }
 }

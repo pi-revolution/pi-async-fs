@@ -51,7 +51,7 @@ pub enum ReadTargetRegionError {
 
 impl ClassifyErrorKind for ReadTargetRegionError {
     fn classify_error_kind(&self) -> ErrorKind {
-        todo!("第一批次仅声明错误分类接口")
+        ErrorKind::InvalidInput
     }
 }
 
@@ -84,7 +84,35 @@ impl ReadTargetRegion {
     /// 排除起点和包含终点所需的 `+1` 使用受检算术。规范化后反向范围立即
     /// 失败；空范围合法。该方法不接触缓冲区，也不执行 I/O。
     pub fn new(start: Bound<usize>, end: Bound<usize>) -> RawResult<Self, ReadTargetRegionError> {
-        todo!("第一批次仅声明读取目标范围构造接口")
+        let start = match start {
+            Bound::Unbounded => 0,
+            Bound::Included(start) => start,
+            Bound::Excluded(start) => start
+                .checked_add(1)
+                .ok_or(ReadTargetRegionError::ExcludedStartOverflow)?,
+        };
+        let end_exclusive = match end {
+            Bound::Unbounded => None,
+            Bound::Excluded(end_exclusive) => Some(end_exclusive),
+            Bound::Included(end) => Some(
+                end.checked_add(1)
+                    .ok_or(ReadTargetRegionError::IncludedEndOverflow)?,
+            ),
+        };
+
+        if let Some(end_exclusive) = end_exclusive {
+            if start > end_exclusive {
+                return Err(ReadTargetRegionError::Reversed {
+                    start,
+                    end_exclusive,
+                });
+            }
+        }
+
+        Ok(Self {
+            start,
+            end_exclusive,
+        })
     }
 
     /// 创建覆盖整个已初始化可写视图的目标意图。
@@ -93,13 +121,16 @@ impl ReadTargetRegion {
     /// 为合法空范围；该显式构造器不意味着实现 [`Default`]。
     #[must_use]
     pub fn full() -> Self {
-        todo!("第一批次仅声明完整读取目标范围构造接口")
+        Self {
+            start: 0,
+            end_exclusive: None,
+        }
     }
 
     /// 返回规范化后包含的起点。
     #[must_use]
     pub fn start(&self) -> usize {
-        todo!("第一批次仅声明读取目标起点访问接口")
+        self.start
     }
 
     /// 返回规范化后的可选固定排他终点。
@@ -107,7 +138,7 @@ impl ReadTargetRegion {
     /// `None` 表示“到本次目标已初始化视图末尾”，不是未知值或追加权限。
     #[must_use]
     pub fn end_exclusive(&self) -> Option<usize> {
-        todo!("第一批次仅声明读取目标终点访问接口")
+        self.end_exclusive
     }
 
     /// 把目标意图绑定到真实已初始化可写视图长度。
@@ -120,31 +151,52 @@ impl ReadTargetRegion {
         &self,
         initialized_len: usize,
     ) -> RawResult<Range<usize>, ReadTargetRegionError> {
-        todo!("第一批次仅声明读取目标范围解析接口")
+        let end_exclusive = self.end_exclusive.unwrap_or(initialized_len);
+        if self.start > end_exclusive || end_exclusive > initialized_len {
+            return Err(ReadTargetRegionError::OutOfBounds {
+                start: self.start,
+                end_exclusive,
+                initialized_len,
+            });
+        }
+
+        Ok(self.start..end_exclusive)
     }
 }
 
 impl Clone for ReadTargetRegion {
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明 Clone 接口")
+        Self {
+            start: self.start,
+            end_exclusive: self.end_exclusive,
+        }
     }
 }
 
 impl fmt::Debug for ReadTargetRegion {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        formatter
+            .debug_struct("ReadTargetRegion")
+            .field("start", &self.start)
+            .field("end_exclusive", &self.end_exclusive)
+            .finish()
     }
 }
 
 impl fmt::Display for ReadTargetRegion {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        match self.end_exclusive {
+            Some(end_exclusive) => {
+                write!(formatter, "[{}, {})", self.start, end_exclusive)
+            }
+            None => write!(formatter, "[{}, end)", self.start),
+        }
     }
 }
 
 impl PartialEq for ReadTargetRegion {
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明 PartialEq 接口")
+        self.start == other.start && self.end_exclusive == other.end_exclusive
     }
 }
 
@@ -152,13 +204,20 @@ impl Eq for ReadTargetRegion {}
 
 impl PartialOrd for ReadTargetRegion {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for ReadTargetRegion {
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明 Ord 接口")
+        self.start.cmp(&other.start).then_with(|| {
+            match (self.end_exclusive, other.end_exclusive) {
+                (Some(left), Some(right)) => left.cmp(&right),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
+        })
     }
 }
 
@@ -167,7 +226,8 @@ impl Hash for ReadTargetRegion {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明 Hash 接口")
+        self.start.hash(state);
+        self.end_exclusive.hash(state);
     }
 }
 
@@ -175,7 +235,7 @@ impl TryFrom<Range<usize>> for ReadTargetRegion {
     type Error = ReadTargetRegionError;
 
     fn try_from(range: Range<usize>) -> Result<Self, Self::Error> {
-        todo!("第一批次仅声明 TryFrom<Range> 接口")
+        Self::new(Bound::Included(range.start), Bound::Excluded(range.end))
     }
 }
 
@@ -183,19 +243,26 @@ impl TryFrom<RangeInclusive<usize>> for ReadTargetRegion {
     type Error = ReadTargetRegionError;
 
     fn try_from(range: RangeInclusive<usize>) -> Result<Self, Self::Error> {
-        todo!("第一批次仅声明 TryFrom<RangeInclusive> 接口")
+        let (start, end) = range.into_inner();
+        Self::new(Bound::Included(start), Bound::Included(end))
     }
 }
 
 impl From<RangeFrom<usize>> for ReadTargetRegion {
     fn from(range: RangeFrom<usize>) -> Self {
-        todo!("第一批次仅声明 From<RangeFrom> 接口")
+        Self {
+            start: range.start,
+            end_exclusive: None,
+        }
     }
 }
 
 impl From<RangeTo<usize>> for ReadTargetRegion {
     fn from(range: RangeTo<usize>) -> Self {
-        todo!("第一批次仅声明 From<RangeTo> 接口")
+        Self {
+            start: 0,
+            end_exclusive: Some(range.end),
+        }
     }
 }
 
@@ -203,12 +270,12 @@ impl TryFrom<RangeToInclusive<usize>> for ReadTargetRegion {
     type Error = ReadTargetRegionError;
 
     fn try_from(range: RangeToInclusive<usize>) -> Result<Self, Self::Error> {
-        todo!("第一批次仅声明 TryFrom<RangeToInclusive> 接口")
+        Self::new(Bound::Unbounded, Bound::Included(range.end))
     }
 }
 
 impl From<RangeFull> for ReadTargetRegion {
-    fn from(range: RangeFull) -> Self {
-        todo!("第一批次仅声明 From<RangeFull> 接口")
+    fn from(_: RangeFull) -> Self {
+        Self::full()
     }
 }

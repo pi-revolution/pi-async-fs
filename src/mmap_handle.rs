@@ -25,34 +25,94 @@
 // 范围时必须在 append 完成后另行建立新的不相交映射。网络文件、库外句柄
 // 和其它进程仍位于当前协调保证之外。
 //
-// 第一批次只冻结公开布局边界和基本能力，尚不实现映射访问或刷新。映射
-// 生命周期不提供显式 `close()`：句柄离开作用域后由 `Drop` 解除映射并
-// 释放租约；需要观察失败的持久化动作必须在 Drop 前显式完成。任何构造、
-// 方法和资源析构实现都必须等相应签名逐项冻结后再以 `todo!()` 声明。
+// 映射生命周期不提供显式 `close()`：句柄离开作用域后由字段析构解除映射
+// 并释放租约；需要观察失败的持久化动作必须在 Drop 前显式完成。公开句柄
+// 只暴露已经冻结的范围、字节视图和刷新能力。
 
 use core::cell::Cell;
 use core::fmt;
 use core::future::Future;
 use core::marker::PhantomData;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 use std::sync::Arc;
 
-use pi_result::RawResult;
+use pi_result::{InteropResultExt, RawResult};
 
+use crate::bounded_blocking;
 use crate::{BufferFailure, DetachableWriteBuffer, MmapRange};
+
+// 公开刷新 Future 被取消后，同步刷新仍可能已经在线程池中执行。该包装在
+// 正常路径转发结果，在未完成即析构时只分离内部任务，使任务继续持有映射
+// 核心，直到底层不再访问虚拟地址。
+struct MmapDetachOnDrop<T> {
+    task: Option<async_global_executor::Task<T>>,
+}
+
+impl<T> MmapDetachOnDrop<T> {
+    fn new(task: async_global_executor::Task<T>) -> Self {
+        Self { task: Some(task) }
+    }
+}
+
+impl<T> Unpin for MmapDetachOnDrop<T> {}
+
+impl<T> Future for MmapDetachOnDrop<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<T> {
+        let this = self.get_mut();
+        let result = Pin::new(
+            this.task.as_mut().expect("mmap task must exist while polling"),
+        )
+        .poll(context);
+        if result.is_ready() {
+            this.task.take();
+        }
+        result
+    }
+}
+
+impl<T> Drop for MmapDetachOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.detach();
+        }
+    }
+}
+
+// 映射状态的最后一个拥有者释放时执行一次协调登记清理。该字段必须排在
+// 原生映射字段之后，使 Rust 的字段析构顺序先解除虚拟地址映射，再开放
+// 相同文件范围给后续操作。
+struct MappingCleanup {
+    release: Option<Box<dyn FnOnce() + Send + Sync + 'static>>,
+}
+
+impl MappingCleanup {
+    fn new(release: Box<dyn FnOnce() + Send + Sync + 'static>) -> Self {
+        Self {
+            release: Some(release),
+        }
+    }
+}
+
+impl Drop for MappingCleanup {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
 
 // 一个只读逻辑映射实例的共享内部所有权。
 //
-// 后续实现会在这里持有底层只读映射、稳定文件身份、范围租约及平台资源。
+// 这里共同持有底层只读映射、范围租约清理动作及平台资源。
 // 把租约与映射放进同一个引用计数状态，可以确保只读句柄的所有克隆都只
 // 指向一个映射和一项协调登记。
 struct ReadMmapState {
     range: MmapRange,
-}
-
-impl Drop for ReadMmapState {
-    fn drop(&mut self) {
-        todo!("第一批次仅声明最后一个只读映射引用的资源释放接口")
-    }
+    mapping: memmap2::Mmap,
+    cleanup: MappingCleanup,
 }
 
 // 可并发共享的只读文件内存映射句柄。
@@ -91,6 +151,21 @@ pub struct ReadMmapHandle {
 }
 
 impl ReadMmapHandle {
+    pub(crate) fn from_mapping(
+        range: MmapRange,
+        mapping: memmap2::Mmap,
+        release: Box<dyn FnOnce() + Send + Sync + 'static>,
+    ) -> Self {
+        debug_assert_eq!(range.len(), mapping.len() as u64);
+        Self {
+            state: Arc::new(ReadMmapState {
+                range,
+                mapping,
+                cleanup: MappingCleanup::new(release),
+            }),
+        }
+    }
+
     // 返回本映射实例覆盖的原始文件逻辑范围。
     //
     // 所有克隆返回同一范围的共享借用。该值不包含操作系统页或分配粒度
@@ -102,7 +177,7 @@ impl ReadMmapHandle {
     ///
     /// 该范围不会因映射建立后的文件尾部追加而扩大。
     pub fn range(&self) -> &MmapRange {
-        todo!("第一批次仅声明只读映射逻辑范围访问接口")
+        &self.state.range
     }
 
     // 返回当前进程可通过本句柄读取的逻辑字节数。
@@ -115,8 +190,9 @@ impl ReadMmapHandle {
     ///
     /// 映射范围保证非空，因此结果始终大于零，并等于 [`Self::as_bytes`] 的
     /// 切片长度。
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
-        todo!("第一批次仅声明只读映射长度访问接口")
+        self.state.mapping.len()
     }
 
     // 借用完整逻辑映射的零复制只读字节视图。
@@ -135,20 +211,19 @@ impl ReadMmapHandle {
     /// 返回切片严格对应 [`Self::range`]，其生命周期不超过本次句柄借用。
     /// 本方法不复制字节、不推进游标，也不把映射内容提升为文件快照。
     pub fn as_bytes(&self) -> &[u8] {
-        todo!("第一批次仅声明只读映射零复制字节视图接口")
+        &self.state.mapping
     }
 }
 
 impl AsRef<[u8]> for ReadMmapHandle {
     fn as_ref(&self) -> &[u8] {
-        todo!("第一批次仅声明只读映射普通写入源视图接口")
+        self.as_bytes()
     }
 }
 
 // owned 只读映射句柄可以整体移动为普通写入操作的独立载体。
 //
-// 该实现属于第一批次唯一获准提供真实行为的
-// [`DetachableWriteBuffer`] 实现范围：脱离不增加引用计数、不复制映射
+// 该实现沿用已冻结的 [`DetachableWriteBuffer`] 行为：脱离不增加引用计数、不复制映射
 // 字节，也不建立新的映射或范围租约；普通错误恢复则把同一个句柄值移回
 // 调用方。
 impl DetachableWriteBuffer for ReadMmapHandle {
@@ -195,29 +270,37 @@ impl<'a> DetachableWriteBuffer for &'a ReadMmapHandle {
 
 impl Clone for ReadMmapHandle {
     fn clone(&self) -> Self {
-        todo!("第一批次仅声明只读映射句柄低成本 Clone 接口")
+        Self {
+            state: Arc::clone(&self.state),
+        }
     }
 }
 
 impl fmt::Debug for ReadMmapHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        formatter
+            .debug_struct("ReadMmapHandle")
+            .field("range", self.range())
+            .field("len", &self.len())
+            .finish()
     }
 }
 
 impl fmt::Display for ReadMmapHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
+        write!(formatter, "read-only mmap {}", self.range())
     }
 }
 
 // 一个可写逻辑映射实例的独占内部所有权。
 //
-// 后续实现会在这里持有底层可写映射、稳定文件身份、范围租约、刷新状态及
-// 平台资源。字段均必须能够安全移动到其它线程，但不得自行提供共享可变
+// 这里共同持有底层可写映射、范围租约清理动作及平台资源。字段均必须能够
+// 安全移动到其它线程，但不得自行提供共享可变
 // 访问。
 struct ReadWriteMmapState {
     range: MmapRange,
+    mapping: memmap2::MmapRaw,
+    cleanup: MappingCleanup,
 }
 
 // 可移动但不可共享的读写文件内存映射句柄。
@@ -247,11 +330,27 @@ struct ReadWriteMmapState {
 /// 移动。它表示一个已经获准的非空逻辑范围；所有读取、修改和刷新都必须通过
 /// 本句柄。丢弃句柄会自动释放映射资源，但不会隐式刷新未持久化修改。
 pub struct ReadWriteMmapHandle {
-    state: ReadWriteMmapState,
+    state: Arc<ReadWriteMmapState>,
     not_sync: PhantomData<Cell<()>>,
 }
 
 impl ReadWriteMmapHandle {
+    pub(crate) fn from_mapping(
+        range: MmapRange,
+        mapping: memmap2::MmapRaw,
+        release: Box<dyn FnOnce() + Send + Sync + 'static>,
+    ) -> Self {
+        debug_assert_eq!(range.len(), mapping.len() as u64);
+        Self {
+            state: Arc::new(ReadWriteMmapState {
+                range,
+                mapping,
+                cleanup: MappingCleanup::new(release),
+            }),
+            not_sync: PhantomData,
+        }
+    }
+
     // 返回本映射实例覆盖的原始文件逻辑范围。
     //
     // 该范围不包含后端为了满足页或分配粒度对齐而映射的隐藏字节，也不会
@@ -262,7 +361,7 @@ impl ReadWriteMmapHandle {
     ///
     /// 该范围不会因映射建立后的文件尾部追加而扩大。
     pub fn range(&self) -> &MmapRange {
-        todo!("第一批次仅声明读写映射逻辑范围访问接口")
+        &self.state.range
     }
 
     // 返回当前进程可通过本句柄访问的逻辑字节数。
@@ -274,8 +373,9 @@ impl ReadWriteMmapHandle {
     /// 返回可通过本句柄访问的逻辑字节数。
     ///
     /// 结果始终大于零，并等于只读和可写完整视图的切片长度。
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
-        todo!("第一批次仅声明读写映射长度访问接口")
+        self.state.mapping.len()
     }
 
     // 借用完整逻辑映射的零复制只读字节视图。
@@ -288,7 +388,15 @@ impl ReadWriteMmapHandle {
     ///
     /// 返回切片严格对应 [`Self::range`]，且不使本句柄成为普通写入源。
     pub fn as_bytes(&self) -> &[u8] {
-        todo!("第一批次仅声明读写映射零复制只读视图接口")
+        // SAFETY: 建图时已验证非空长度和文件快照，映射核心在返回借用期间由
+        // 句柄 Arc 保持存活；公开协调合同阻止进程内截断和相交访问。共享
+        // 借用不能与同一句柄的可写借用同时存在。
+        unsafe {
+            core::slice::from_raw_parts(
+                self.state.mapping.as_ptr(),
+                self.state.mapping.len(),
+            )
+        }
     }
 
     // 独占借用完整逻辑映射的零复制可写字节视图。
@@ -306,7 +414,16 @@ impl ReadWriteMmapHandle {
     /// 返回切片严格对应 [`Self::range`]。修改会改变映射内容，但本方法本身
     /// 不刷新、不建立事务，也不提供回滚保证。
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
-        todo!("第一批次仅声明读写映射零复制可写视图接口")
+        // SAFETY: 读写句柄不可克隆且不实现 Sync，本方法又要求独占借用，
+        // 因而公开安全接口同时最多产生一个可写切片。内部 Arc 克隆只允许
+        // 调用 MmapRaw 的同步刷新，不构造 Rust 字节引用；刷新与操作系统对
+        // 同一映射的写回可以安全重叠，但取消后不建立内容快照或顺序保证。
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.state.mapping.as_mut_ptr(),
+                self.state.mapping.len(),
+            )
+        }
     }
 
     // 同步完成地刷新本句柄整个公开逻辑映射范围内的脏页。
@@ -395,7 +512,15 @@ impl ReadWriteMmapHandle {
     pub fn flush(
         &mut self,
     ) -> impl Future<Output = pi_result::Result<()>> + Send + '_ {
-        async { todo!("第一批次仅声明读写映射同步完成型刷新接口") }
+        let state = Arc::clone(&self.state);
+        async move {
+            let task = async_global_executor::spawn(async move {
+                bounded_blocking::unblock(move || state.mapping.flush())
+                    .await?
+                    .into_classified_error()
+            });
+            MmapDetachOnDrop::new(task).await
+        }
     }
 }
 
@@ -407,24 +532,22 @@ impl ReadWriteMmapHandle {
 // 回滚。该实现不赋予增长能力，也不使本类型成为普通写入源。
 impl AsMut<[u8]> for ReadWriteMmapHandle {
     fn as_mut(&mut self) -> &mut [u8] {
-        todo!("第一批次仅声明读写映射固定读取目标视图接口")
+        self.as_bytes_mut()
     }
 }
 
 impl fmt::Debug for ReadWriteMmapHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Debug 接口")
+        formatter
+            .debug_struct("ReadWriteMmapHandle")
+            .field("range", self.range())
+            .field("len", &self.len())
+            .finish()
     }
 }
 
 impl fmt::Display for ReadWriteMmapHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明 Display 接口")
-    }
-}
-
-impl Drop for ReadWriteMmapHandle {
-    fn drop(&mut self) {
-        todo!("第一批次仅声明读写映射句柄资源释放接口")
+        write!(formatter, "read-write mmap {}", self.range())
     }
 }

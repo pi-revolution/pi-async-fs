@@ -76,10 +76,33 @@ pub enum FileFlushMode {
     DataAndMetadata,
 }
 
+impl FileFlushMode {
+    fn rank(&self) -> u8 {
+        match self {
+            Self::Data => 0,
+            Self::DataAndMetadata => 1,
+        }
+    }
+
+    fn debug_name(&self) -> &'static str {
+        match self {
+            Self::Data => "Data",
+            Self::DataAndMetadata => "DataAndMetadata",
+        }
+    }
+
+    fn display_name(&self) -> &'static str {
+        match self {
+            Self::Data => "data",
+            Self::DataAndMetadata => "data-and-metadata",
+        }
+    }
+}
+
 impl fmt::Debug for FileFlushMode {
     // 以 Rust 变体名显示所选刷新等级，不读取文件或后端状态。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明文件刷新模式 Debug 接口")
+        formatter.write_str(self.debug_name())
     }
 }
 
@@ -89,14 +112,14 @@ impl fmt::Display for FileFlushMode {
     // 该文本服务于日志和诊断，不是序列化格式，也不承诺可以用 `FromStr`
     // 解析回来。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明文件刷新模式 Display 接口")
+        formatter.write_str(self.display_name())
     }
 }
 
 impl PartialEq for FileFlushMode {
     // 仅在两个值请求相同最低保证等级时判等。
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明文件刷新模式 PartialEq 接口")
+        self.rank() == other.rank()
     }
 }
 
@@ -105,14 +128,14 @@ impl Eq for FileFlushMode {}
 impl PartialOrd for FileFlushMode {
     // 返回与 [`Ord`] 一致的完整保证强度顺序。
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明文件刷新模式 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for FileFlushMode {
     // 按 `Data < DataAndMetadata` 比较最低保证强度。
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明文件刷新模式 Ord 接口")
+        self.rank().cmp(&other.rank())
     }
 }
 
@@ -124,6 +147,6 @@ impl Hash for FileFlushMode {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明文件刷新模式 Hash 接口")
+        self.rank().hash(state);
     }
 }

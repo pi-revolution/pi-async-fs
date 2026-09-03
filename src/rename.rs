@@ -77,21 +77,38 @@ pub enum RenameCommitEvidence {
 impl fmt::Debug for RenameCommitEvidence {
     // 以 Rust 变体名称显示证据，不查询 source 或 destination。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明改名提交证据 Debug 接口")
+        formatter.write_str(match self {
+            Self::NotRenamedByOperation => "NotRenamedByOperation",
+            Self::RenamedByOperation => "RenamedByOperation",
+            Self::Unknown => "Unknown",
+        })
     }
 }
 
 impl fmt::Display for RenameCommitEvidence {
     // 输出面向日志的人类可读摘要，不承诺可反向解析。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明改名提交证据 Display 接口")
+        formatter.write_str(match self {
+            Self::NotRenamedByOperation => "rename not committed by operation",
+            Self::RenamedByOperation => "rename committed by operation",
+            Self::Unknown => "rename commit outcome unknown",
+        })
     }
 }
 
 impl PartialEq for RenameCommitEvidence {
     // 仅在两个值表示相同提交证据标签时判等。
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明改名提交证据 PartialEq 接口")
+        matches!(
+            (self, other),
+            (
+                Self::NotRenamedByOperation,
+                Self::NotRenamedByOperation
+            ) | (
+                Self::RenamedByOperation,
+                Self::RenamedByOperation
+            ) | (Self::Unknown, Self::Unknown)
+        )
     }
 }
 
@@ -100,14 +117,22 @@ impl Eq for RenameCommitEvidence {}
 impl PartialOrd for RenameCommitEvidence {
     // 返回与 [`Ord`] 一致的证据标签全序。
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明改名提交证据 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for RenameCommitEvidence {
     // 按变体声明顺序比较，不表达证据强度或恢复优先级。
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明改名提交证据 Ord 接口")
+        fn rank(evidence: &RenameCommitEvidence) -> u8 {
+            match evidence {
+                RenameCommitEvidence::NotRenamedByOperation => 0,
+                RenameCommitEvidence::RenamedByOperation => 1,
+                RenameCommitEvidence::Unknown => 2,
+            }
+        }
+
+        rank(self).cmp(&rank(other))
     }
 }
 
@@ -117,7 +142,12 @@ impl Hash for RenameCommitEvidence {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明改名提交证据 Hash 接口")
+        let discriminant = match self {
+            Self::NotRenamedByOperation => 0_u8,
+            Self::RenamedByOperation => 1_u8,
+            Self::Unknown => 2_u8,
+        };
+        discriminant.hash(state);
     }
 }
 
@@ -169,7 +199,10 @@ impl RenameFailure {
     #[must_use]
     /// 按“错误、提交证据”的顺序构造失败值。
     pub fn new(error: Error, commit_evidence: RenameCommitEvidence) -> Self {
-        todo!("第一批次仅声明改名失败载体构造接口")
+        Self {
+            error,
+            commit_evidence,
+        }
     }
 
     // 共享借用统一诊断报告。
@@ -182,7 +215,7 @@ impl RenameFailure {
     #[must_use]
     /// 返回失败诊断的共享引用。
     pub fn error(&self) -> &Error {
-        todo!("第一批次仅声明改名失败诊断访问接口")
+        &self.error
     }
 
     // 共享借用本次改名记录的提交证据。
@@ -195,7 +228,7 @@ impl RenameFailure {
     #[must_use]
     /// 返回改名提交证据的共享引用。
     pub fn commit_evidence(&self) -> &RenameCommitEvidence {
-        todo!("第一批次仅声明改名失败提交证据访问接口")
+        &self.commit_evidence
     }
 
     // 消费失败载体并取回诊断报告与提交证据。
@@ -206,20 +239,28 @@ impl RenameFailure {
     #[must_use]
     /// 消费失败值并按构造顺序返回全部字段。
     pub fn into_parts(self) -> (Error, RenameCommitEvidence) {
-        todo!("第一批次仅声明改名失败载体拆解接口")
+        (self.error, self.commit_evidence)
     }
 }
 
 impl fmt::Debug for RenameFailure {
     // 显示统一诊断与提交证据的脱敏调试摘要。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明改名失败载体 Debug 接口")
+        formatter
+            .debug_struct("RenameFailure")
+            .field("error", &self.error)
+            .field("commit_evidence", &self.commit_evidence)
+            .finish()
     }
 }
 
 impl fmt::Display for RenameFailure {
     // 输出面向日志的失败摘要，不承诺稳定文本协议。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明改名失败载体 Display 接口")
+        write!(
+            formatter,
+            "{}; commit: {}",
+            self.error, self.commit_evidence
+        )
     }
 }

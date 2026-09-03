@@ -92,21 +92,38 @@ pub enum CreateTargetEvidence {
 impl fmt::Debug for CreateTargetEvidence {
     // 以 Rust 变体名显示证据，不查询 namespace 或目标状态。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明创建目标证据 Debug 接口")
+        formatter.write_str(match self {
+            Self::NotCreatedByOperation => "NotCreatedByOperation",
+            Self::CreatedByOperation => "CreatedByOperation",
+            Self::Unknown => "Unknown",
+        })
     }
 }
 
 impl fmt::Display for CreateTargetEvidence {
     // 输出面向日志的人类可读摘要，不承诺可反向解析。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明创建目标证据 Display 接口")
+        formatter.write_str(match self {
+            Self::NotCreatedByOperation => "target not created by operation",
+            Self::CreatedByOperation => "target created by operation",
+            Self::Unknown => "target creation outcome unknown",
+        })
     }
 }
 
 impl PartialEq for CreateTargetEvidence {
     // 仅在两个值表示相同证据标签时判等。
     fn eq(&self, other: &Self) -> bool {
-        todo!("第一批次仅声明创建目标证据 PartialEq 接口")
+        matches!(
+            (self, other),
+            (
+                Self::NotCreatedByOperation,
+                Self::NotCreatedByOperation
+            ) | (
+                Self::CreatedByOperation,
+                Self::CreatedByOperation
+            ) | (Self::Unknown, Self::Unknown)
+        )
     }
 }
 
@@ -115,14 +132,22 @@ impl Eq for CreateTargetEvidence {}
 impl PartialOrd for CreateTargetEvidence {
     // 返回与 [`Ord`] 一致的证据标签全序。
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!("第一批次仅声明创建目标证据 PartialOrd 接口")
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for CreateTargetEvidence {
     // 按变体声明顺序比较，不表达证据强度或恢复优先级。
     fn cmp(&self, other: &Self) -> Ordering {
-        todo!("第一批次仅声明创建目标证据 Ord 接口")
+        fn rank(evidence: &CreateTargetEvidence) -> u8 {
+            match evidence {
+                CreateTargetEvidence::NotCreatedByOperation => 0,
+                CreateTargetEvidence::CreatedByOperation => 1,
+                CreateTargetEvidence::Unknown => 2,
+            }
+        }
+
+        rank(self).cmp(&rank(other))
     }
 }
 
@@ -132,7 +157,12 @@ impl Hash for CreateTargetEvidence {
     where
         H: Hasher,
     {
-        todo!("第一批次仅声明创建目标证据 Hash 接口")
+        let discriminant = match self {
+            Self::NotCreatedByOperation => 0_u8,
+            Self::CreatedByOperation => 1_u8,
+            Self::Unknown => 2_u8,
+        };
+        discriminant.hash(state);
     }
 }
 
@@ -212,7 +242,7 @@ impl<A, F> CrossProcessCreateSuccess<A, F> {
     #[must_use]
     /// 按“授权、文件资源”的顺序构造成功值。
     pub fn new(authority: A, file: F) -> Self {
-        todo!("第一批次仅声明跨进程创建成功载体构造接口")
+        Self { file, authority }
     }
 
     // 共享借用与首个文件资源配对的跨进程授权。
@@ -242,7 +272,7 @@ impl<A, F> CrossProcessCreateSuccess<A, F> {
     #[must_use]
     /// 返回跨进程授权的共享引用。
     pub fn authority(&self) -> &A {
-        todo!("第一批次仅声明跨进程创建授权访问接口")
+        &self.authority
     }
 
     // 共享借用协调式创建得到的首个文件资源。
@@ -273,7 +303,7 @@ impl<A, F> CrossProcessCreateSuccess<A, F> {
     #[must_use]
     /// 返回首个文件资源的共享引用。
     pub fn file(&self) -> &F {
-        todo!("第一批次仅声明跨进程创建文件共享访问接口")
+        &self.file
     }
 
     // 独占可变地借用协调式创建得到的首个文件资源。
@@ -307,7 +337,7 @@ impl<A, F> CrossProcessCreateSuccess<A, F> {
     #[must_use]
     /// 返回首个文件资源的独占引用。
     pub fn file_mut(&mut self) -> &mut F {
-        todo!("第一批次仅声明跨进程创建文件可变访问接口")
+        &mut self.file
     }
 
     // 消费成功载体并一次性取回跨进程授权与首个文件资源。
@@ -347,21 +377,25 @@ impl<A, F> CrossProcessCreateSuccess<A, F> {
     #[must_use]
     /// 消费成功值并按构造顺序返回授权和文件资源。
     pub fn into_parts(self) -> (A, F) {
-        todo!("第一批次仅声明跨进程创建成功载体拆解接口")
+        (self.authority, self.file)
     }
 }
 
 impl<A, F> fmt::Debug for CrossProcessCreateSuccess<A, F> {
     // 显示不依赖底层资源格式化能力的脱敏结构摘要。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明跨进程创建成功载体 Debug 接口")
+        formatter.write_str(
+            "CrossProcessCreateSuccess { authority: <present>, file: <present> }",
+        )
     }
 }
 
 impl<A, F> fmt::Display for CrossProcessCreateSuccess<A, F> {
     // 输出面向日志的脱敏成功载体摘要，不承诺稳定文本协议。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明跨进程创建成功载体 Display 接口")
+        formatter.write_str(
+            "cross-process authority and file resource are present",
+        )
     }
 }
 
@@ -442,7 +476,10 @@ impl CreateFailure {
     #[must_use]
     /// 按“错误、目标证据”的顺序构造失败值。
     pub fn new(error: Error, target_evidence: CreateTargetEvidence) -> Self {
-        todo!("第一批次仅声明创建失败载体构造接口")
+        Self {
+            error,
+            target_evidence,
+        }
     }
 
     // 共享借用本次创建失败的统一 `pi_result` 诊断报告。
@@ -473,7 +510,7 @@ impl CreateFailure {
     #[must_use]
     /// 返回失败诊断的共享引用。
     pub fn error(&self) -> &Error {
-        todo!("第一批次仅声明创建失败诊断访问接口")
+        &self.error
     }
 
     // 共享借用本次创建操作的目标副作用证据。
@@ -504,7 +541,7 @@ impl CreateFailure {
     #[must_use]
     /// 返回目标创建证据的共享引用。
     pub fn target_evidence(&self) -> &CreateTargetEvidence {
-        todo!("第一批次仅声明创建目标证据访问接口")
+        &self.target_evidence
     }
 
     // 消费失败载体并一次性取回诊断报告与目标副作用证据。
@@ -528,21 +565,29 @@ impl CreateFailure {
     #[must_use]
     /// 消费失败值并按构造顺序返回全部字段。
     pub fn into_parts(self) -> (Error, CreateTargetEvidence) {
-        todo!("第一批次仅声明创建失败载体拆解接口")
+        (self.error, self.target_evidence)
     }
 }
 
 impl fmt::Debug for CreateFailure {
     // 显示统一诊断和目标证据，不查询或修改 namespace 目标。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明创建失败载体 Debug 接口")
+        formatter
+            .debug_struct("CreateFailure")
+            .field("error", &self.error)
+            .field("target_evidence", &self.target_evidence)
+            .finish()
     }
 }
 
 impl fmt::Display for CreateFailure {
     // 输出面向日志的失败摘要，不承诺稳定文本协议。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明创建失败载体 Display 接口")
+        write!(
+            formatter,
+            "{}; target: {}",
+            self.error, self.target_evidence
+        )
     }
 }
 
@@ -660,7 +705,11 @@ impl<L> CreateDirectoriesFailure<L> {
         confirmed_created: Vec<L>,
         uncertain_targets: Vec<L>,
     ) -> Self {
-        todo!("第一批次仅声明递归目录创建失败载体构造接口")
+        Self {
+            error,
+            confirmed_created,
+            uncertain_targets,
+        }
     }
 
     // 共享借用递归目录创建失败的统一诊断报告。
@@ -691,7 +740,7 @@ impl<L> CreateDirectoriesFailure<L> {
     #[must_use]
     /// 返回失败诊断的共享引用。
     pub fn error(&self) -> &Error {
-        todo!("第一批次仅声明递归目录创建失败诊断访问接口")
+        &self.error
     }
 
     // 按祖先到后代顺序共享借用已确认由本次操作创建的目录定位符。
@@ -726,7 +775,7 @@ impl<L> CreateDirectoriesFailure<L> {
     #[must_use]
     /// 返回已确认由本次操作创建的目录列表。
     pub fn confirmed_created(&self) -> &[L] {
-        todo!("第一批次仅声明已确认创建目录访问接口")
+        &self.confirmed_created
     }
 
     // 按祖先到后代顺序共享借用创建结果不确定的目录定位符。
@@ -761,7 +810,7 @@ impl<L> CreateDirectoriesFailure<L> {
     #[must_use]
     /// 返回已经提交创建但结果无法证明的目录列表。
     pub fn uncertain_targets(&self) -> &[L] {
-        todo!("第一批次仅声明结果不确定目录访问接口")
+        &self.uncertain_targets
     }
 
     // 消费失败载体并一次性取回诊断与两组目标副作用证据。
@@ -794,20 +843,31 @@ impl<L> CreateDirectoriesFailure<L> {
     #[must_use]
     /// 消费失败值并按构造顺序返回全部字段。
     pub fn into_parts(self) -> (Error, Vec<L>, Vec<L>) {
-        todo!("第一批次仅声明递归目录创建失败载体拆解接口")
+        (self.error, self.confirmed_created, self.uncertain_targets)
     }
 }
 
 impl<L> fmt::Debug for CreateDirectoriesFailure<L> {
     // 显示统一诊断和两类目标数量，不格式化或查询 locator。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明递归目录创建失败载体 Debug 接口")
+        formatter
+            .debug_struct("CreateDirectoriesFailure")
+            .field("error", &self.error)
+            .field("confirmed_created_count", &self.confirmed_created.len())
+            .field("uncertain_targets_count", &self.uncertain_targets.len())
+            .finish()
     }
 }
 
 impl<L> fmt::Display for CreateDirectoriesFailure<L> {
     // 输出脱敏失败摘要及目标数量，不承诺稳定文本协议。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("第一批次仅声明递归目录创建失败载体 Display 接口")
+        write!(
+            formatter,
+            "{}; confirmed created: {}; uncertain targets: {}",
+            self.error,
+            self.confirmed_created.len(),
+            self.uncertain_targets.len()
+        )
     }
 }
