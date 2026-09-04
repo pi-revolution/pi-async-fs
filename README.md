@@ -29,14 +29,7 @@
 当前版本不提供文件变化监听、`remove_dir_all`、替换式改名、顺序写、任意偏移的
 普通写、目录树事务或远端对象存储能力。`remove_dir` 只删除空目录。
 
-## 工具链与依赖
-
-当前唯一支持并用于验收的工具链是 `nightly-2026-06-25`。本功能库不提供
-`rust-toolchain.toml`，也不在 `Cargo.toml` 中固定 `rust-version`；请显式使用：
-
-```text
-cargo +nightly-2026-06-25 build --locked
-```
+## 依赖
 
 基本依赖可以写为：
 
@@ -967,17 +960,17 @@ panic 处理正常错误。
 建议使用与当前支持边界一致的串行单 crate 命令：
 
 ```text
-cargo +nightly-2026-06-25 test --locked --all-features -- --test-threads=1
-cargo +nightly-2026-06-25 test --release --locked --all-features -- --test-threads=1
-cargo +nightly-2026-06-25 clippy --locked --all-targets --all-features -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo +nightly-2026-06-25 doc --locked --all-features --no-deps
+cargo test --locked --all-features -- --test-threads=1
+cargo test --release --locked --all-features -- --test-threads=1
+cargo clippy --locked --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
 ```
 
 需要查看每个公开枚举变体、字段、泛型约束和完整签名时，可生成并打开本库
 Rustdoc：
 
 ```text
-cargo +nightly-2026-06-25 doc --locked --all-features --no-deps --open
+cargo doc --locked --all-features --no-deps --open
 ```
 
 ## 许可证
