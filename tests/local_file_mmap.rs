@@ -248,10 +248,10 @@ fn test_local_read_only_mmap_enforces_role_and_snapshot_boundaries() {
     assert_eq!(whole.as_bytes(), b"0123456789");
 }
 
-// 验证活动只读映射期间只允许元信息和普通 buffer 的尾部追加；读、覆盖、截断、
-// 文件 flush 均冲突且无副作用，映射释放后这些操作恢复。
+// 验证活动只读映射允许元信息、普通 buffer 追加与文件刷新；读、覆盖和截断
+// 仍冲突且无副作用，映射释放后这些破坏性/普通读取操作恢复。
 #[test]
-fn test_local_read_only_mmap_operation_matrix_allows_only_metadata_and_append() {
+fn test_local_read_only_mmap_operation_matrix_allows_metadata_append_and_flush() {
     let temporary_directory = tempfile::tempdir().expect("应能建立真实临时目录");
     let path = temporary_directory.path().join("source");
     std::fs::write(&path, b"0123456789").expect("应能建立真实测试文件");
@@ -301,9 +301,8 @@ fn test_local_read_only_mmap_operation_matrix_allows_only_metadata_and_append() 
     let error = block_on(truncate_resource.truncate(5))
         .expect_err("活动映射必须阻止截断");
     assert_eq!(error.current_context(), &ErrorKind::Conflict);
-    let error = block_on(append_resource.flush(FileFlushMode::Data))
-        .expect_err("活动映射必须阻止普通文件强刷新");
-    assert_eq!(error.current_context(), &ErrorKind::Conflict);
+    block_on(append_resource.flush(FileFlushMode::Data))
+        .expect("活动映射应允许普通文件强刷新");
 
     block_on(append_resource.append(b"XY".to_vec()))
         .expect("既有映射必须允许后续严格尾部追加");
@@ -484,7 +483,7 @@ fn test_local_read_write_mmap_enforces_role_snapshot_and_authority_boundaries() 
 }
 
 // 验证读写映射可作为不同文件定位／顺序固定读取目标并推进源游标；同文件读、
-// 覆盖、截断、flush 和映射派生 append 源被拒，普通追加仍允许。
+// 覆盖、截断和映射派生 append 源被拒，普通追加及文件刷新允许。
 #[test]
 fn test_local_read_write_mmap_is_fixed_read_target_and_obeys_operation_matrix() {
     let temporary_directory = tempfile::tempdir().expect("应能建立真实临时目录");
@@ -564,9 +563,8 @@ fn test_local_read_write_mmap_is_fixed_read_target_and_obeys_operation_matrix() 
     let error = block_on(truncate_resource.truncate(5))
         .expect_err("读写映射必须阻止同文件截断");
     assert_eq!(error.current_context(), &ErrorKind::Conflict);
-    let error = block_on(append_resource.flush(FileFlushMode::Data))
-        .expect_err("读写映射必须阻止普通文件强刷新");
-    assert_eq!(error.current_context(), &ErrorKind::Conflict);
+    block_on(append_resource.flush(FileFlushMode::Data))
+        .expect("读写映射应允许普通文件强刷新");
 
     let mapped_subslice = &handle.as_bytes()[1..4];
     let failure = block_on(append_resource.append(mapped_subslice))

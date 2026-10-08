@@ -495,6 +495,7 @@ struct FileCoordinationData {
     active_metadata_queries: u64,
     active_content_reads: u64,
     active_appends: u64,
+    active_flushes: u64,
     exclusive_operation: bool,
     mapping_ranges: BTreeMap<u64, MappingRangeRegistration>,
     active_mapping_views: BTreeMap<usize, ActiveMappingView>,
@@ -544,6 +545,7 @@ impl FileCoordinationState {
                 active_metadata_queries: 0,
                 active_content_reads: 0,
                 active_appends: 0,
+                active_flushes: 0,
                 exclusive_operation: false,
                 mapping_ranges: BTreeMap::new(),
                 active_mapping_views: BTreeMap::new(),
@@ -601,6 +603,7 @@ impl FileCoordinationState {
                     || data.active_metadata_queries != 0
                     || data.active_content_reads != 0
                     || data.active_appends != 0
+                    || data.active_flushes != 0
                     || !data.mapping_ranges.is_empty()
                     || data.pending_mappings != 0))
         {
@@ -740,6 +743,7 @@ impl FileCoordinationState {
             || data.active_metadata_queries != 0
             || data.active_content_reads != 0
             || data.active_appends != 0
+            || data.active_flushes != 0
             || data.exclusive_operation
             || !data.mapping_ranges.is_empty()
             || data.pending_mappings != 0
@@ -766,6 +770,7 @@ impl FileCoordinationState {
             || data.active_metadata_queries != 0
             || data.active_content_reads != 0
             || data.active_appends != 0
+            || data.active_flushes != 0
             || data.exclusive_operation
             || !data.mapping_ranges.is_empty()
             || data.pending_mappings != 0
@@ -888,6 +893,33 @@ impl FileCoordinationState {
         ))
     }
 
+    // 刷新不改内容或范围，与映射、追加、读取和其它刷新共享文件。独立计数
+    // 只用于反向阻止覆盖、截断等破坏性操作，并由后台完成者一直保留至同步结束。
+    // 在原同步锁的短临界区内完成 O(1) 检查/增加；不等异步任务、不调用用户
+    // 代码。计数溢出返回 ResourceExhausted 且不改状态；已有独占时返回 Conflict。
+    // 非纯函数，成功取得一项必须由 RAII 归还的许可；独立请求不是严格幂等。
+    // 设计：B2H-DES-001，见 .scratch/pi-async-fs-mainline/FILE_FLUSH_COEXISTENCE_DESIGN_2026-10-08.md。
+    // 真实组合与取消入口：tests/local_file_flush.rs、tests/local_cross_process_integration.rs。
+    fn try_acquire_flush(
+        self: &Arc<Self>,
+    ) -> pi_result::Result<FileOperationLease> {
+        let mut data = lock_unpoisoned(&self.data);
+        if data.exclusive_operation {
+            return Err(pi_result::error_stack::Report::new(
+                pi_result::ErrorKind::Conflict,
+            ));
+        }
+        data.active_flushes = data.active_flushes.checked_add(1).ok_or_else(|| {
+            pi_result::error_stack::Report::new(
+                pi_result::ErrorKind::ResourceExhausted,
+            )
+        })?;
+        Ok(FileOperationLease::new(
+            Arc::clone(self),
+            FileOperationLeaseKind::Flush,
+        ))
+    }
+
     fn try_acquire_exclusive(
         self: &Arc<Self>,
     ) -> pi_result::Result<FileOperationLease> {
@@ -896,6 +928,7 @@ impl FileCoordinationState {
             || data.active_metadata_queries != 0
             || data.active_content_reads != 0
             || data.active_appends != 0
+            || data.active_flushes != 0
             || !data.mapping_ranges.is_empty()
         {
             return Err(pi_result::error_stack::Report::new(
@@ -921,6 +954,7 @@ impl FileCoordinationState {
             || data.active_metadata_queries != 0
             || data.active_content_reads != 0
             || data.active_appends != 0
+            || data.active_flushes != 0
             || data.exclusive_operation
             || !data.mapping_ranges.is_empty()
             || data.pending_mappings != 0
@@ -948,6 +982,7 @@ impl FileCoordinationState {
             || data.active_metadata_queries != 0
             || data.active_content_reads != 0
             || data.active_appends != 0
+            || data.active_flushes != 0
             || data.exclusive_operation
             || !data.mapping_ranges.is_empty()
             || data.pending_mappings != 0
@@ -1332,16 +1367,18 @@ impl CrossProcessAuthorityCore {
         })
     }
 
-    async fn acquire_metadata_operation(
+    // 元信息与普通文件刷新均只需要内容门的共享许可。刷新不取得追加/范围门，
+    // 因而不会把其它进程的活动映射或独立追加误判为破坏性全文件访问。
+    async fn acquire_shared_content_operation(
         self: &Arc<Self>,
-    ) -> pi_result::Result<CrossProcessMetadataLease> {
+    ) -> pi_result::Result<CrossProcessSharedContentLease> {
         let active_owner = self.acquire_operation_owner().await?;
         let content_path = self.binding.layout.stable_content_gate.clone();
         let content = bounded_blocking::unblock_result(move || {
             try_lock_sidecar_shared(&content_path)
         })
         .await?;
-        Ok(CrossProcessMetadataLease {
+        Ok(CrossProcessSharedContentLease {
             _content: content,
             _active_owner: active_owner,
         })
@@ -1560,7 +1597,7 @@ struct CrossProcessReadLease {
     _active_owner: CoordinatedResourceLease,
 }
 
-struct CrossProcessMetadataLease {
+struct CrossProcessSharedContentLease {
     _content: std::fs::File,
     _active_owner: CoordinatedResourceLease,
 }
@@ -3450,6 +3487,7 @@ enum FileOperationLeaseKind {
     MetadataQuery,
     ContentRead,
     Append,
+    Flush,
     Exclusive,
 }
 
@@ -3484,6 +3522,11 @@ impl Drop for FileOperationLease {
             FileOperationLeaseKind::Append => {
                 if data.active_appends != 0 {
                     data.active_appends -= 1;
+                }
+            }
+            FileOperationLeaseKind::Flush => {
+                if data.active_flushes != 0 {
+                    data.active_flushes -= 1;
                 }
             }
             FileOperationLeaseKind::Exclusive => {
@@ -6625,7 +6668,7 @@ impl FileIo for LocalFile {
             let _lease = self.coordination.try_acquire_metadata_query()?;
             let _cross_process_lease = match self.cross_process_authority() {
                 Some(authority) => {
-                    Some(authority.acquire_metadata_operation().await?)
+                    Some(authority.acquire_shared_content_operation().await?)
                 }
                 None => None,
             };
@@ -7627,16 +7670,17 @@ impl FileIo for LocalFile {
                 FileAccessMode::Append
                     | FileAccessMode::Overwrite
                     | FileAccessMode::Truncate
+                    | FileAccessMode::ReadWriteMmap
             ) {
                 return Err(pi_result::error_stack::Report::new(
                     pi_result::ErrorKind::InvalidState,
                 ));
             }
 
-            let exclusive_lease = self.coordination.try_acquire_exclusive()?;
+            let flush_lease = self.coordination.try_acquire_flush()?;
             let cross_process_lease = match self.cross_process_authority() {
                 Some(authority) => Some(
-                    authority.acquire_exclusive_operation().await?,
+                    authority.acquire_shared_content_operation().await?,
                 ),
                 None => None,
             };
@@ -7649,7 +7693,10 @@ impl FileIo for LocalFile {
             })?;
 
             // 强刷新已经提交后，公开 Future 的取消只停止等待。actor 必须继续
-            // 持有文件资源与排它租约，直到系统刷新完成并归还资源。
+            // 持有文件资源与刷新许可，直到系统刷新完成并归还资源；映射与追加
+            // 可继续使用，但覆盖/截断等破坏性操作不能提前放行。
+            // B2H-DES-001 的取消/跨线程回归见 tests/local_file_flush.rs；合作式
+            // 父子进程持有映射的组合回归见 tests/local_cross_process_integration.rs。
             let task = async_global_executor::spawn(async move {
                 let result = match mode {
                     FileFlushMode::Data => file.sync_data().await,
@@ -7657,7 +7704,7 @@ impl FileIo for LocalFile {
                 };
                 *file_guard = Some(file);
                 drop(cross_process_lease);
-                drop(exclusive_lease);
+                drop(flush_lease);
                 result
             });
             DetachOnDrop::new(task).await.into_classified_error()

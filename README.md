@@ -185,7 +185,7 @@ async fn write_then_read(path: PathBuf) -> pi_result::Result<[u8; 5]> {
 | `EntryName` | `Native(OsString)`、`Remote(Atom)` | 本地名称不要求 UTF-8；远端名称不是跨进程序列化格式 |
 | `FileLocator` | `NativePath(PathBuf)`、`Remote(RemoteLocator)` | 只表示位置种类，不表示目标存在或已经打开 |
 | `FileType` | `RegularFile`、`Directory`、`SymbolicLink`、`RemoteObject`、`BlockDevice`、`CharacterDevice`、`Fifo`、`Socket`、`Other`、`Unknown` | `Other` 表示已知但未单列的种类；`Unknown` 表示无法可靠分类 |
-| `FileFlushMode` | `Data`、`DataAndMetadata` | 后者请求更强的普通文件刷新等级；两者都不刷新父目录或映射脏页 |
+| `FileFlushMode` | `Data`、`DataAndMetadata` | 后者请求更强的普通文件刷新等级；两者都不刷新父目录，也不替代映射专属刷新保证 |
 | `WalkDepthLimit` | `Unlimited`、`Limited { max_depth }` | `max_depth` 是包含式上限；零表示不产生任何后代 |
 | `CrossProcessCoordinationRoot` | `FileParent`、`Custom(PathBuf)` | `Custom` 必须使用非空绝对路径，并在首次协调操作前配置 |
 
@@ -316,7 +316,7 @@ pub trait DetachableWriteBuffer: AsRef<[u8]> + Sized {
 | `Append` | `byte_len`、`append`、`flush` | 普通读取、覆盖、截断、映射 |
 | `Overwrite` | `byte_len`、`overwrite_all`、`flush` | 普通读取、追加、截断、映射 |
 | `ReadMmap` | `byte_len`、只读映射创建 | 普通读取、写入、截断、读写映射、普通文件刷新 |
-| `ReadWriteMmap` | `byte_len`、只读或读写映射创建 | 普通读取、普通写入、截断、普通文件刷新 |
+| `ReadWriteMmap` | `byte_len`、只读或读写映射创建、`flush` | 普通读取、普通写入、截断 |
 | `Truncate` | `byte_len`、`truncate`、`flush` | 读取、追加、覆盖、映射、扩容 |
 
 访问模式不表示跨进程协调等级。同一模式既可用于普通资源，也可用于通过 authority
@@ -340,7 +340,7 @@ pub trait DetachableWriteBuffer: AsRef<[u8]> + Sized {
 | `map_read_only(&self, range) -> Result<ReadMmapHandle>` | 协调式只读映射 | 只适用于通过有效 authority 打开的文件资源 |
 | `unsafe map_read_write_uncoordinated(&self, range) -> Result<ReadWriteMmapHandle>` | 未协调读写映射 | 在调用方承担外部前提后返回独占可写透明句柄 |
 | `map_read_write(&self, range) -> Result<ReadWriteMmapHandle>` | 协调式读写映射 | 只适用于通过有效 authority 打开的文件资源 |
-| `flush(&mut self, mode) -> Result<()>` | 刷新普通文件 | 等待请求的普通文件刷新边界；不刷新 MMAP 脏页，也不刷新父目录 |
+| `flush(&mut self, mode) -> Result<()>` | 刷新普通文件 | 等待请求的普通文件刷新边界，可与映射及独立追加并存；不替代映射专属刷新，不刷新父目录 |
 
 固定读取的 `B` 满足：
 
@@ -707,8 +707,8 @@ async fn replace_then_shorten(path: PathBuf) -> pi_result::Result<()> {
 
 - 同一文件可以同时存在任意数量的不相交映射；
 - 任意相交范围都会被拒绝，不区分只读或读写权限；
-- 活动映射与同文件普通读取、覆盖、截断、普通文件刷新和安全删除互斥；
-- 已经建立的映射可以与之后开始的严格尾部追加并存；
+- 活动映射与同文件普通读取、覆盖、截断和安全删除互斥；
+- 已经建立的只读/可写映射可以与严格尾部追加及普通文件刷新并存；
 - 正在执行追加时不能同时建立新映射；
 - 后续追加不会扩大既有映射的范围；
 - 映射字节只能通过透明句柄访问；
@@ -758,6 +758,42 @@ async fn open_coordinated_mapping(
 
 `ReadWriteMmapHandle` 可以整体移动到另一个线程，但不能共享并发写，也不能克隆。
 修改必须使用 `as_bytes_mut()`，需要可观察的刷新结果时必须显式等待 `flush()`。
+
+### 保留映射并追加、刷新
+
+下面的函数保留已有只读映射，追加记录后等待文件刷新，并返回原映射。文件必须
+至少有 4096 字节，且调用方提供的授权必须满足跨进程协调合同。追加不会扩大
+原映射，也不要求先释放它。
+
+```rust
+use pi_async_fs::{
+    CrossProcessFileAuthority, FileAccessMode, FileFlushMode, FileIo,
+    FileNamespace, LocalFileNamespace, MmapRange, ReadMmapHandle,
+};
+
+async fn append_while_mapping(
+    authority: &CrossProcessFileAuthority,
+) -> pi_result::Result<ReadMmapHandle> {
+    let namespace = LocalFileNamespace::new();
+    let mapper = namespace
+        .open_with_cross_process_authority(authority, FileAccessMode::ReadMmap)
+        .await?;
+    let mapping = mapper
+        .map_read_only(MmapRange::new(0, 4096).expect("范围非空"))
+        .await?;
+    let mut appender = namespace
+        .open_with_cross_process_authority(authority, FileAccessMode::Append)
+        .await?;
+    if let Err(failure) = appender.append(b"record\n".to_vec()).await {
+        return Err(failure.into_parts().0);
+    }
+    appender.flush(FileFlushMode::DataAndMetadata).await?;
+    Ok(mapping)
+}
+```
+
+可写映射同样允许与追加及文件刷新并存。若还修改了映射内容，应另外等待
+`ReadWriteMmapHandle::flush()`；两条写入路径的刷新不构成原子事务。
 
 ## 严格复制、改名和删除
 
@@ -877,7 +913,9 @@ fn configure_capacity() -> pi_result::Result<()> {
 | 正在执行的追加与新映射建立 | 不能同时进入 |
 | 多个不相交映射 | 可以并存 |
 | 任意相交映射 | 拒绝，不区分权限 |
-| 活动映射与普通读取、覆盖、截断、文件刷新或安全删除 | 拒绝 |
+| 活动映射与普通读取、覆盖、截断或安全删除 | 拒绝 |
+| 只读/可写映射与普通文件刷新 | 可以并存，无需释放映射；映射写后也允许调用文件刷新 |
+| 独立资源上的追加、读取、元信息与普通文件刷新 | 不因刷新自动互斥；其它已有冲突规则仍生效 |
 | 覆盖或截断与其它内容操作 | 按其排它语义拒绝冲突调用 |
 | 默认改名与已打开文件或映射 | 本库不额外互斥；是否成功仍受平台约束 |
 | namespace 元信息查询与内容操作 | 可以并存，但查询结果只是瞬时快照 |
@@ -924,6 +962,17 @@ panic 处理正常错误。
 普通文件使用 `FileIo::flush(FileFlushMode)`；映射修改使用
 `ReadWriteMmapHandle::flush()`。两类刷新都不承诺父目录名称变更已经同步，也不保证
 掉电、操作系统崩溃、失信存储控制器、介质损坏或硬件故障后的绝对存续。
+
+映射可以持续保留，追加数据后直接等待 `FileIo::flush`，不需要先解除只读
+或可写映射。普通文件刷新只与覆盖、截断等全文件破坏性操作互斥。
+不同独立资源的追加与刷新可以并行；若需要确认某次追加已达到所选刷新等级，
+应先等待该次追加成功，再等待刷新成功。一次刷新不保证其它资源上仍在进行
+或之后才开始的追加也已经完成同步。
+
+`ReadWriteMmap` 文件资源也允许调用 `FileIo::flush`，因此映射写后可以请求
+文件刷新；该调用不替代可写映射句柄的脏页刷新保证。要取得映射修改的明确
+完成证据，仍需等待 `ReadWriteMmapHandle::flush()`。只读文件资源不因此
+增加刷新权限，活动只读映射期间应通过独立追加资源刷新普通写入。
 
 ## 注意事项与使用禁忌
 

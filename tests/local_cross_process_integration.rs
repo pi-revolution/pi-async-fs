@@ -6,15 +6,16 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use futures_lite::future::block_on;
+use futures_lite::future::{self, block_on};
 use pi_async_fs::{
     set_cross_process_coordination_root, CrossProcessCoordinationRoot,
-    FileAccessMode, FileIo, FileNamespace, LocalFileNamespace, MmapRange,
-    ReadTargetRegion, RemoveTargetEvidence,
+    FileAccessMode, FileFlushMode, FileIo, FileNamespace, LocalFileNamespace,
+    MmapRange, OverwriteTargetEvidence, ReadTargetRegion, RemoveTargetEvidence,
+    TransferProgress,
 };
 use pi_result::ErrorKind;
 
@@ -48,6 +49,49 @@ fn wait_for_path(path: &Path, description: &str) {
     }
 }
 
+// 只保护本轮映射/刷新子进程夹具的生命周期，不介入生产文件访问逻辑。
+// 成功退出最多等待 30 秒；超时或父进程断言展开时终止并回收子进程，避免
+// 后台仍持有真实文件锁影响下一项测试。受控子进程没有继承输出管道的后代。
+struct ManagedChild {
+    child: Option<Child>,
+}
+
+impl ManagedChild {
+    fn wait_with_output(mut self) -> std::io::Result<Output> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let child = self.child.as_mut().expect("待回收的子进程必须存在");
+            if child.try_wait()?.is_some() {
+                return self.child.take().unwrap().wait_with_output();
+            }
+            if Instant::now() >= deadline {
+                child.kill()?;
+                let output = self.child.take().unwrap().wait_with_output()?;
+                panic!(
+                    "子进程退出超时\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            // 展开期清理不能再次 panic；失败保留诊断，不伪造产品成功结果。
+            if let Err(error) = child.kill() {
+                eprintln!("终止测试子进程失败: {error}");
+            }
+            if let Err(error) = child.wait() {
+                eprintln!("回收测试子进程失败: {error}");
+            }
+        }
+    }
+}
+
 // 以精确过滤器重新启动当前测试二进制，运行指定通用子进程场景。
 fn spawn_current_test(
     test_name: &str,
@@ -55,8 +99,9 @@ fn spawn_current_test(
     target: &Path,
     ready: &Path,
     release: &Path,
-) -> Child {
-    Command::new(std::env::current_exe().expect("应能定位当前测试程序"))
+) -> ManagedChild {
+    let mut command = Command::new(std::env::current_exe().expect("应能定位当前测试程序"));
+    command
         .arg(test_name)
         .arg("--exact")
         .arg("--nocapture")
@@ -65,9 +110,13 @@ fn spawn_current_test(
         .env(READY_PATH, ready)
         .env(RELEASE_PATH, release)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("应能启动隔离测试子进程")
+        .stderr(Stdio::piped());
+    if case == "hold-file-flush" {
+        command.env("BLOCKING_MAX_THREADS", "1");
+    }
+    ManagedChild {
+        child: Some(command.spawn().expect("应能启动隔离测试子进程")),
+    }
 }
 
 // 启动持有独立文件句柄的追加工作进程，并传递可验证的工作者编号。
@@ -125,11 +174,14 @@ fn append_record(worker: u8, index: usize) -> Vec<u8> {
 }
 
 #[test]
-// 子进程夹具：持有协调式映射直到父进程发出释放信号，并验证内容始终可读。
+// 子进程夹具：持有协调式只读或可写映射直到父进程释放；可写分支同时通过
+// 真实映射与文件刷新建立完成证据，全部等待有截止，不模拟协调或刷新逻辑。
 fn test_helper_hold_coordinated_mapping_in_child_process() {
-    if std::env::var(CHILD_CASE).as_deref() != Ok("hold-mapping") {
-        return;
-    }
+    let writable = match std::env::var(CHILD_CASE).as_deref() {
+        Ok("hold-mapping") => false,
+        Ok("hold-write-mapping") => true,
+        _ => return,
+    };
     let target = required_path(TARGET_PATH);
     let ready = required_path(READY_PATH);
     let release = required_path(RELEASE_PATH);
@@ -140,11 +192,25 @@ fn test_helper_hold_coordinated_mapping_in_child_process() {
         block_on(namespace.establish_cross_process_authority(&target))
     }
     .expect("子进程应加入既有协调域");
-    let resource = block_on(namespace.open_with_cross_process_authority(
+    let mut resource = block_on(namespace.open_with_cross_process_authority(
         &authority,
-        FileAccessMode::ReadMmap,
+        if writable { FileAccessMode::ReadWriteMmap } else { FileAccessMode::ReadMmap },
     ))
     .expect("子进程应打开协调式映射资源");
+    if writable {
+        let mut mapping = block_on(resource.map_read_write(
+            MmapRange::new(2, 7).expect("测试范围应有效"),
+        ))
+        .expect("子进程应建立活动可写映射");
+        mapping.as_bytes_mut().copy_from_slice(b"ABCDE");
+        block_on(mapping.flush()).expect("映射修改应取得同步完成证据");
+        block_on(resource.flush(FileFlushMode::DataAndMetadata))
+            .expect("子进程读写映射资源也应支持普通文件刷新");
+        std::fs::write(&ready, b"ready").expect("应能发布可写映射就绪信号");
+        wait_for_path(&release, "父进程释放信号");
+        assert_eq!(mapping.as_bytes(), b"ABCDE");
+        return;
+    }
     let mapping = block_on(resource.map_read_only(
         MmapRange::new(2, 7).expect("测试范围应有效"),
     ))
@@ -153,6 +219,67 @@ fn test_helper_hold_coordinated_mapping_in_child_process() {
     std::fs::write(&ready, b"ready").expect("应能发布子进程就绪信号");
     wait_for_path(&release, "父进程释放信号");
     assert_eq!(mapping.as_bytes(), b"23456");
+}
+
+// B2H-DES-001：仅调控隔离进程的真实单 worker 队列，使生产刷新在取得跨
+// 进程许可后保持未完成；取消等待后仍由生产完成者保有许可。不触碰协议文件、
+// 不模拟锁/刷新，父进程的公开拒绝与恢复结果才是协调正确性的判断依据。
+#[test]
+fn test_helper_hold_cancelled_file_flush_in_child_process() {
+    if std::env::var(CHILD_CASE).as_deref() != Ok("hold-file-flush") {
+        return;
+    }
+    let target = required_path(TARGET_PATH);
+    let ready = required_path(READY_PATH);
+    let release = required_path(RELEASE_PATH);
+    let namespace = LocalFileNamespace::new();
+    // SAFETY: 父子进程独占目录并使用同版本、同物理根的公开协调入口。
+    let authority = unsafe {
+        block_on(namespace.establish_cross_process_authority(&target))
+    }
+    .expect("子进程应加入既有协调域");
+    let mut file = block_on(namespace.open_with_cross_process_authority(
+        &authority,
+        FileAccessMode::Append,
+    ))
+    .expect("子进程应打开独立刷新资源");
+
+    let (first_started_sender, first_started_receiver) = std::sync::mpsc::channel();
+    let (first_release_sender, first_release_receiver) = std::sync::mpsc::channel();
+    let first_worker = blocking::unblock(move || {
+        first_started_sender.send(()).unwrap();
+        first_release_receiver.recv_timeout(Duration::from_secs(15))
+            .expect("首个执行资源门必须在截止内释放");
+    });
+    first_started_receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+    let mut flush = Box::pin(file.flush(FileFlushMode::DataAndMetadata));
+    assert!(block_on(future::poll_once(flush.as_mut())).is_none());
+
+    // 在公开 Future 尚未继续轮询时，把第二个执行资源门排在已提交工作之后。
+    // 第一门释放后第二门保留 worker；再轮询公开 Future 后其真实同步仍排队，
+    // 不能靠磁盘快慢猜测该操作是否仍在进行。任务队列不处理任何文件副作用。
+    let (second_started_sender, second_started_receiver) = std::sync::mpsc::channel();
+    let (second_release_sender, second_release_receiver) = std::sync::mpsc::channel();
+    let second_worker = blocking::unblock(move || {
+        second_started_sender.send(()).unwrap();
+        second_release_receiver.recv_timeout(Duration::from_secs(15))
+            .expect("刷新执行资源门必须在截止内释放");
+    });
+    first_release_sender.send(()).unwrap();
+    block_on(first_worker);
+    second_started_receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+    assert!(
+        block_on(future::poll_once(flush.as_mut())).is_none(),
+        "同步 worker 被占用时刷新不得已完成",
+    );
+    drop(flush);
+    std::fs::write(&ready, b"ready").expect("应能报告已取消等待的在途刷新");
+    wait_for_path(&release, "父进程完成冲突与共存断言");
+    second_release_sender.send(()).unwrap();
+    block_on(second_worker);
+    assert_eq!(block_on(file.byte_len()).unwrap(), 8);
+    block_on(file.flush(FileFlushMode::DataAndMetadata))
+        .expect("后台取消请求完成后资源应可再次成功刷新");
 }
 
 #[test]
@@ -289,6 +416,10 @@ fn test_cross_process_mapping_conflict_matrix_and_lifecycle_removal() {
     .expect("映射存活时应允许打开独立追加资源");
     block_on(appender.append(Vec::from(&b"A"[..])))
         .expect("既有映射与严格 O_APPEND 追加允许并存");
+    block_on(appender.flush(FileFlushMode::Data))
+        .expect("其它进程只读映射存活时必须允许追加数据刷新");
+    block_on(appender.flush(FileFlushMode::DataAndMetadata))
+        .expect("其它进程只读映射存活时必须允许数据及元信息刷新");
     drop(appender);
     assert_eq!(std::fs::read(&target).unwrap(), b"0123456789A");
 
@@ -325,6 +456,110 @@ fn test_cross_process_mapping_conflict_matrix_and_lifecycle_removal() {
     block_on(namespace.remove_file_with_cross_process_authority(&authority))
         .expect("其它进程释放最后一个活动所有者后删除应成功");
     assert!(!target.exists());
+}
+
+// B2H-DES-001：子进程持续握住可写映射及独立文件资源时，父进程的完整追加与
+// 两种强刷新均可成功；子进程旧范围与父进程尾部内容严格核验，跨进程锁不误互斥。
+#[test]
+fn test_cross_process_writable_mapping_coexists_with_append_and_file_flush() {
+    const HELPER: &str = "test_helper_hold_coordinated_mapping_in_child_process";
+    let temporary_directory = tempfile::tempdir().expect("应能建立真实临时目录");
+    let target = temporary_directory.path().join("managed-file");
+    let ready = temporary_directory.path().join("child-ready");
+    let release = temporary_directory.path().join("child-release");
+    std::fs::write(&target, b"0123456789").expect("应能建立真实测试文件");
+    let namespace = LocalFileNamespace::new();
+    // SAFETY: 父子进程独占目录并只通过本库同版本、同物理根的协调入口访问文件。
+    let authority = unsafe {
+        block_on(namespace.establish_cross_process_authority(&target))
+    }
+    .expect("父进程应建立协调域");
+    let child = spawn_current_test(HELPER, "hold-write-mapping", &target, &ready, &release);
+    wait_for_path(&ready, "子进程活动可写映射及刷新完成");
+    let mut appender = block_on(namespace.open_with_cross_process_authority(
+        &authority,
+        FileAccessMode::Append,
+    ))
+    .expect("父进程应能独立打开追加资源");
+    block_on(appender.append(b"XY".to_vec()))
+        .expect("其它进程可写映射存在时应允许严格追加");
+    block_on(appender.flush(FileFlushMode::Data))
+        .expect("其它进程可写映射不能阻止追加内容的数据刷新");
+    block_on(appender.flush(FileFlushMode::DataAndMetadata))
+        .expect("其它进程可写映射不能阻止数据及元信息刷新");
+    assert_eq!(std::fs::read(&target).unwrap(), b"01ABCDE789XY");
+    std::fs::write(&release, b"release").expect("应能释放子进程映射");
+    let output = child.wait_with_output().expect("应能回收子进程");
+    assert!(
+        output.status.success(),
+        "可写映射子进程失败\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"01ABCDE789XY");
+}
+
+// B2H-DES-001：另一真实进程取消刷新等待但同步尚未完成时，覆盖/截断必须
+// 明确冲突并无副作用，元信息、追加及另一刷新可并存；真实完成后破坏性操作
+// 恢复。全部目标访问来自公开协调式生产 API，子进程由作用域 guard 回收。
+#[test]
+fn test_cross_process_in_flight_file_flush_protects_whole_file_operations() {
+    const HELPER: &str = "test_helper_hold_cancelled_file_flush_in_child_process";
+    let temporary_directory = tempfile::tempdir().expect("应能建立真实临时目录");
+    let target = temporary_directory.path().join("managed-file");
+    let ready = temporary_directory.path().join("child-ready");
+    let release = temporary_directory.path().join("child-release");
+    std::fs::write(&target, b"012345").unwrap();
+    let namespace = LocalFileNamespace::new();
+    // SAFETY: 父子进程独占目标目录且只使用同版本、同物理根的协调式入口。
+    let authority = unsafe {
+        block_on(namespace.establish_cross_process_authority(&target))
+    }
+    .expect("父进程应建立协调域");
+    let mut overwrite = block_on(namespace.open_with_cross_process_authority(
+        &authority, FileAccessMode::Overwrite,
+    )).unwrap();
+    let mut truncate = block_on(namespace.open_with_cross_process_authority(
+        &authority, FileAccessMode::Truncate,
+    )).unwrap();
+    let mut appender = block_on(namespace.open_with_cross_process_authority(
+        &authority, FileAccessMode::Append,
+    )).unwrap();
+    // 负面控制：普通持有这些资源并不使破坏性操作永久失败。
+    block_on(overwrite.overwrite_all(b"012345".to_vec())).unwrap();
+    block_on(truncate.truncate(6)).unwrap();
+    let child = spawn_current_test(HELPER, "hold-file-flush", &target, &ready, &release);
+    wait_for_path(&ready, "子进程在途文件刷新");
+
+    let failure = block_on(overwrite.overwrite_all(b"destroy".to_vec()))
+        .expect_err("另一进程同步未结束时覆盖必须冲突");
+    let (error, buffer, progress, evidence) = failure.into_parts();
+    assert_eq!(error.current_context(), &ErrorKind::Conflict);
+    assert_eq!(buffer, b"destroy");
+    assert_eq!(progress, TransferProgress::Exact { bytes: 0 });
+    assert_eq!(evidence, OverwriteTargetEvidence::Unchanged);
+    let error = block_on(truncate.truncate(0))
+        .expect_err("另一进程同步未结束时截断必须冲突");
+    assert_eq!(error.current_context(), &ErrorKind::Conflict);
+    assert_eq!(std::fs::read(&target).unwrap(), b"012345");
+    assert_eq!(block_on(appender.byte_len()).unwrap(), 6);
+    block_on(appender.append(b"XY".to_vec())).unwrap();
+    block_on(appender.flush(FileFlushMode::Data)).unwrap();
+    block_on(appender.flush(FileFlushMode::DataAndMetadata)).unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"012345XY");
+
+    std::fs::write(&release, b"release").unwrap();
+    let output = child.wait_with_output().expect("应在截止内回收刷新子进程");
+    assert!(
+        output.status.success(),
+        "刷新子进程失败\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    block_on(overwrite.overwrite_all(b"done".to_vec()))
+        .expect("刷新完成后覆盖必须恢复准入");
+    block_on(truncate.truncate(2)).expect("刷新完成后截断必须恢复准入");
+    assert_eq!(std::fs::read(&target).unwrap(), b"do");
 }
 
 #[test]

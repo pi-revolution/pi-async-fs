@@ -1,6 +1,6 @@
 [package]
 name = "pi_async_fs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 description = "Runtime-agnostic asynchronous filesystem contracts for local and remote storage"
@@ -42,3 +42,6 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globa
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[[bench]]
+name = "file_flush_coexistence"
