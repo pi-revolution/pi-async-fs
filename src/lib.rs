@@ -12,12 +12,17 @@
 
 mod available_space;
 mod bounded_blocking;
+mod coordination_root;
+mod coordination_root_config;
+mod coordination_root_snapshot;
 mod copy;
 mod create;
 mod directory;
 mod cross_process_coordination;
 mod file_access;
 mod file_flush;
+mod file_identity;
+mod file_identity_query;
 mod file_io;
 mod growable_read_buffer;
 mod locator;
@@ -27,17 +32,23 @@ mod mmap_handle;
 mod mmap_range;
 mod namespace;
 mod overwrite;
+mod open_admission_key;
+mod open_admission_native;
+mod open_admission_state;
 mod read_growth;
 mod read_target;
 mod rename;
 mod remove;
 mod transfer;
+mod unsupported_exclusive_owner;
 mod walk;
 mod write_buffer;
 mod write_buffer_impls;
 
 pub use available_space::AvailableSpace;
 pub use bounded_blocking::set_local_blocking_capacity;
+pub use coordination_root::CrossProcessCoordinationRoot;
+pub use coordination_root_config::set_cross_process_coordination_root;
 pub use copy::{
     CopyFailure, CopyOutcome, CopyStagingEvidence, CopyTargetEvidence,
 };
@@ -46,16 +57,13 @@ pub use create::{
     CrossProcessCreateSuccess,
 };
 pub use directory::{DirectoryEntry, EntryName};
-pub use cross_process_coordination::{
-    set_cross_process_coordination_root, CrossProcessCoordinationRoot,
-    CrossProcessFileAuthority,
-};
+pub use cross_process_coordination::CrossProcessFileAuthority;
 pub use file_access::FileAccessMode;
 pub use file_flush::FileFlushMode;
 pub use file_io::FileIo;
 pub use growable_read_buffer::GrowableReadBuffer;
 pub use locator::{FileLocator, RemoteLocator, RemoteLocatorError};
-pub use local::{LocalFile, LocalFileNamespace};
+pub use local::{ExclusiveFileOwner, LocalFile, LocalFileNamespace};
 pub use metadata::{FileMetadata, FileTimes, FileType, PortablePermissions, ResourceVersion};
 pub use mmap_handle::{ReadMmapHandle, ReadWriteMmapHandle};
 pub use mmap_range::{MmapRange, MmapRangeError};
@@ -66,5 +74,6 @@ pub use read_target::{ReadTargetRegion, ReadTargetRegionError};
 pub use rename::{RenameCommitEvidence, RenameFailure};
 pub use remove::{RemoveFailure, RemoveTargetEvidence};
 pub use transfer::{BufferFailure, TransferProgress};
+pub use unsupported_exclusive_owner::UnsupportedExclusiveFileOwner;
 pub use walk::{WalkDepthLimit, WalkEntry, WalkOptions};
 pub use write_buffer::DetachableWriteBuffer;

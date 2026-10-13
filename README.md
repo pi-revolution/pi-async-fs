@@ -24,6 +24,7 @@
 - 普通文件刷新和读写映射刷新；
 - 同一进程内、跨独立文件资源和线程的冲突操作协调；
 - 显式、合作式的跨进程协调能力；
+- 合作式的跨线程、跨进程文件独占，以及独占所有者的显式单角色派生；
 - 写入失败时返还原始缓冲区，并同时报告可证明的传输进度和目标状态。
 
 当前版本不提供文件变化监听、`remove_dir_all`、替换式改名、顺序写、任意偏移的
@@ -72,7 +73,8 @@ cargo tree -e features -i pi_share
 `LocalFileNamespace::new()` 返回轻量、可克隆且 `Send + Sync` 的本地 namespace
 入口。同一进程中它的所有实例和克隆遵守相同的公开协调语义。`LocalFile` 是拥有型
 活动资源，不实现 `Clone`、`Copy` 或 `Default`；需要第二个资源时必须再次调用
-`open`，不能复制一个已经打开的资源。
+`open`，不能复制一个已经打开的资源。已取得独占所有者时，必须改用
+`open_with_exclusive_owner` 显式派生，不能通过普通 `open` 绕过自己的独占。
 
 所有异步方法返回 `Send` Future。Future 可以在其借用生命周期内在线程之间迁移，
 但接口不会替调用方启动或选择异步运行时。从未被轮询的 Future 不产生文件系统
@@ -123,9 +125,9 @@ async fn write_then_read(path: PathBuf) -> pi_result::Result<[u8; 5]> {
 
 | 类型 | 中文名称 | 作用与使用位置 |
 | --- | --- | --- |
-| `FileNamespace` | 文件命名空间接口 | 通过定位符查询和修改名称空间，并创建独立文件资源；包含 5 个关联类型和 22 个异步方法 |
+| `FileNamespace` | 文件命名空间接口 | 通过定位符查询和修改名称空间，并创建独立文件资源；包含 6 个关联类型和 25 个异步方法 |
 | `FileIo` | 已打开文件输入输出接口 | 操作一个已经绑定访问角色的文件资源；包含 15 个异步方法，没有关联类型 |
-| `LocalFileNamespace` | 本地文件命名空间 | 内置的 `FileNamespace<Locator = PathBuf, File = LocalFile>` 适配器；可克隆、可跨线程共享 |
+| `LocalFileNamespace` | 本地文件命名空间 | 内置的 `FileNamespace<Locator = PathBuf, File = LocalFile, ExclusiveOwner = ExclusiveFileOwner>` 适配器；可克隆、可跨线程共享 |
 | `LocalFile` | 本地文件资源 | 只能由 `LocalFileNamespace` 交付的不可克隆文件资源；满足 `FileIo + Send + Sync` |
 | `BoxDirectoryStream<'a, L>` | 装箱目录项流 | 默认的 `Send` 浅层目录流，每项为 `pi_result::Result<DirectoryEntry<L>>` |
 | `BoxWalkStream<'a, L>` | 装箱递归遍历流 | 默认的 `Send` 递归流，每项为 `pi_result::Result<WalkEntry<L>>` |
@@ -187,7 +189,7 @@ async fn write_then_read(path: PathBuf) -> pi_result::Result<[u8; 5]> {
 | `FileType` | `RegularFile`、`Directory`、`SymbolicLink`、`RemoteObject`、`BlockDevice`、`CharacterDevice`、`Fifo`、`Socket`、`Other`、`Unknown` | `Other` 表示已知但未单列的种类；`Unknown` 表示无法可靠分类 |
 | `FileFlushMode` | `Data`、`DataAndMetadata` | 后者请求更强的普通文件刷新等级；两者都不刷新父目录，也不替代映射专属刷新保证 |
 | `WalkDepthLimit` | `Unlimited`、`Limited { max_depth }` | `max_depth` 是包含式上限；零表示不产生任何后代 |
-| `CrossProcessCoordinationRoot` | `FileParent`、`Custom(PathBuf)` | `Custom` 必须使用非空绝对路径，并在首次协调操作前配置 |
+| `CrossProcessCoordinationRoot` | `FileParent`、`Custom(PathBuf)` | `Custom` 必须使用非空绝对路径，并在任何文件资源创建、打开或复制首次轮询前配置 |
 
 输入校验错误枚举均为 `#[non_exhaustive]`：
 
@@ -297,13 +299,17 @@ pub trait DetachableWriteBuffer: AsRef<[u8]> + Sized {
 
 | 类型或函数 | 中文名称 | 作用与关键边界 |
 | --- | --- | --- |
-| `CrossProcessCoordinationRoot` | 跨进程协调根策略 | `FileParent` 使用目标父目录策略；`Custom(PathBuf)` 指定所有协调操作共同使用的绝对根位置 |
+| `CrossProcessCoordinationRoot` | 跨进程协调根策略 | `FileParent` 使用与目标文件所在的同级目录策略；`Custom(PathBuf)` 指定所有协调操作共同使用的绝对根位置 |
 | `CrossProcessFileAuthority` | 跨进程文件授权 | 不透明、拥有型能力值，绑定一个具体目标实例；不是操作系统访问权限，也不能序列化后交给其它进程 |
-| `set_cross_process_coordination_root` | 设置协调根策略 | 在首次协调操作前设置一次；相同值重复设置成功，不同值冲突，不提供重置 |
+| `ExclusiveFileOwner` | 文件独占所有者 | 本地独占打开成功后交付的不透明资格；不是 `FileIo`，须显式派生独立角色资源；不可克隆、复制、默认构造、比较或序列化，支持 `Debug + Display + Send + Sync + 'static` |
+| `UnsupportedExclusiveFileOwner` | 不支持独占的所有者占位类型 | 无变体、无合法实例的枚举，作为不支持独占的 namespace 默认关联类型；不是可以伪造的成功所有者 |
+| `set_cross_process_coordination_root` | 设置协调根策略 | 在首次文件创建、打开或复制被轮询前设置；相同值重复设置成功，不同值冲突，不提供重置 |
 
 跨进程保证是合作式合同：所有会影响目标身份、长度、内容、映射或名称的相关进程
 都必须遵守同一套公共协调入口，并选择实际指向同一协调位置的根策略。库外句柄、
-不合作程序、不同库副本、硬链接别名旁路或不一致的根配置不受 authority 强制约束。
+不合作程序、不同库副本或不一致的根配置不受强制约束。新增的打开独占按真实
+文件对象识别硬链接；原 authority 的内容协议仍有名称绑定要求，不能把这项
+打开保证理解为所有内容操作都能经任意别名进入。
 
 ## `FileAccessMode` 能力矩阵
 
@@ -337,9 +343,9 @@ pub trait DetachableWriteBuffer: AsRef<[u8]> + Sized {
 | `overwrite_all(&mut self, B) -> RawResult<(), OverwriteFailure<B>>` | 全文件覆盖 | 成功后文件内容和长度与输入完全一致；空输入产生空文件 |
 | `truncate(&mut self, new_len) -> Result<()>` | 缩短文件 | 只允许 `new_len` 不大于操作时观察到的当前长度；不写入内容，也不允许扩容 |
 | `unsafe map_read_only_uncoordinated(&self, range) -> Result<ReadMmapHandle>` | 未协调只读映射 | 仅在调用方自行满足所有库外并发安全前提时使用 |
-| `map_read_only(&self, range) -> Result<ReadMmapHandle>` | 协调式只读映射 | 只适用于通过有效 authority 打开的文件资源 |
+| `map_read_only(&self, range) -> Result<ReadMmapHandle>` | 协调式只读映射 | 只适用于延续有效 authority 内容授权的资源，包括相应独占所有者派生的映射资源 |
 | `unsafe map_read_write_uncoordinated(&self, range) -> Result<ReadWriteMmapHandle>` | 未协调读写映射 | 在调用方承担外部前提后返回独占可写透明句柄 |
-| `map_read_write(&self, range) -> Result<ReadWriteMmapHandle>` | 协调式读写映射 | 只适用于通过有效 authority 打开的文件资源 |
+| `map_read_write(&self, range) -> Result<ReadWriteMmapHandle>` | 协调式读写映射 | 只适用于延续有效 authority 内容授权的资源，包括相应独占所有者派生的映射资源 |
 | `flush(&mut self, mode) -> Result<()>` | 刷新普通文件 | 等待请求的普通文件刷新边界，可与映射及独立追加并存；不替代映射专属刷新，不刷新父目录 |
 
 固定读取的 `B` 满足：
@@ -370,6 +376,7 @@ B::Recovery: Send + 'a
 | --- | --- | --- |
 | `Locator` | `FileLocator` | namespace 接受的位置值；要求可克隆、可调试、判等、排序、哈希及 `Send + Sync + 'static` |
 | `CrossProcessAuthority` | `CrossProcessFileAuthority` | 本地或后端定义的不透明跨进程授权；要求 `Debug + Display + Send + Sync + 'static` |
+| `ExclusiveOwner` | `UnsupportedExclusiveFileOwner` | 当前后端的文件独占所有者；要求 `Debug + Display + Send + Sync + 'static`，不要求 `Clone`、`Default` 或 `FileIo` |
 | `File` | 无 | 每次成功创建或打开交付的独立 `FileIo + 'static` 资源 |
 | `DirectoryStream<'a>` | `BoxDirectoryStream<'a, Locator>` | `read_dir` 的流；每项为 `Result<DirectoryEntry<Locator>>`，流为 `Send + 'a` |
 | `WalkStream<'a>` | `BoxWalkStream<'a, Locator>` | `walk` 的流；每项为 `Result<WalkEntry<Locator>>`，流为 `Send + 'a` |
@@ -391,7 +398,7 @@ B::Recovery: Send + 'a
 | --- | --- | --- |
 | `create_dir(&locator) -> RawResult<(), CreateFailure>` | 严格创建单层目录 | 父目录必须存在，最终位置必须不存在；失败返回创建证据 |
 | `create_dir_all(&locator) -> RawResult<(), CreateDirectoriesFailure<Locator>>` | 递归创建目录层级 | 已存在目录可复用；失败不自动回滚此前已创建的目录，并返回两类位置清单 |
-| `remove_file(&locator) -> RawResult<(), RemoveFailure>` | 进程内安全删除文件 | 有活动文件资源、映射或冲突操作时拒绝；成功只解除名称绑定 |
+| `remove_file(&locator) -> RawResult<(), RemoveFailure>` | 进程内安全删除文件 | 有活动文件资源、映射或冲突操作时拒绝；成功表示名称移除已完成或已被系统不可逆接受，不保证立即物理删除 |
 | `remove_file_uncoordinated(&locator) -> RawResult<(), RemoveFailure>` | 未协调删除文件 | 不检查或等待本库中的活动资源；仍遵守所在平台的删除结果 |
 | `remove_dir(&locator) -> RawResult<(), RemoveFailure>` | 进程内安全删除空目录 | 只删除空目录，并与同一名称条目的冲突 namespace 操作协调 |
 | `remove_dir_uncoordinated(&locator) -> RawResult<(), RemoveFailure>` | 未协调删除空目录 | 不取得本库的进程内安全保证；仍只允许删除空目录 |
@@ -407,6 +414,10 @@ B::Recovery: Send + 'a
 | `unsafe create_new_coordinated(locator, access) -> RawResult<CrossProcessCreateSuccess<Authority, File>, CreateFailure>` | 协调式严格新建 | 在调用方承担跨进程合作前提后，返回 authority 和首个独立文件资源 |
 | `unsafe establish_cross_process_authority(&locator) -> Result<Authority>` | 为现有文件建立授权 | 在调用方承担合作前提后，为当前目标实例返回不透明 authority |
 | `open_with_cross_process_authority(&authority, access) -> Result<File>` | 使用授权打开文件 | 不再接收 locator；返回继续受同一跨进程合同约束的独立文件资源 |
+| `open_exclusive(&locator) -> Result<ExclusiveOwner>` | 独占打开现有文件 | 非破坏性地取得读写资格；要求共同 `Custom` 根，不创建或截断目标，不返回内容操作资源 |
+| `open_exclusive_with_cross_process_authority(&authority) -> Result<ExclusiveOwner>` | 使用授权独占打开 | 取得独占并延续既有内容授权；授权凭据本身不等于独占资格 |
+| `open_with_exclusive_owner(&owner, &locator, access) -> Result<File>` | 派生独占角色通道 | 核验所有者及真实目标后，交付独立单角色资源；不会取消原有操作互斥 |
+| `copy_new_with_exclusive_owner(&owner, &source, &destination) -> RawResult<CopyOutcome, CopyFailure>` | 使用独占源严格复制 | 显式使用源所有者的资格；严格不替换、固定源长度及双失败证据沿用普通复制合同 |
 | `remove_file_with_cross_process_authority(&authority) -> RawResult<(), RemoveFailure>` | 使用授权删除文件 | 只删除 authority 精确绑定的目标实例；有合作式冲突时立即拒绝 |
 | `unsafe resume_coordinated_file_removal(&locator) -> RawResult<(), RemoveFailure>` | 恢复未完成的协调删除 | 只用于所有内存 authority 已消失后的恢复路径；不能用来开始一次普通新删除 |
 
@@ -631,6 +642,73 @@ async fn walk_two_levels(
 固定顺序或目录快照。枚举期间并发创建、删除或改名不会由目录流自动互斥，因此
 项目可能反映不同观察时刻；需要一致快照的业务必须在更高层建立相应协议。
 
+### 目录变更后的可见性与重新扫描
+
+<a id="readme-directory-visibility"></a>
+
+正常本地文件系统完成文件或目录的创建、改名、名称移除后，会自行更新后续名称
+查询所观察的状态；调用方不需要再调用本库的“目录索引刷新”。本库目前也没有
+这项独立接口。名称变更可见，与这些变更是否已经可靠保存到存储设备，是两件事。
+不能因为系统可能稍后才保存数据，就推断新一次目录扫描必须先执行文件刷新。
+
+正确的使用顺序是：
+
+1. 等待创建、改名或删除操作完成，并检查成功结果或失败证据。只构造 Future，
+   或启动任务但不等待它结束，都不证明变更已经完成。
+2. 若之前已经取得目录流，不要用它验证变更后的完整目录；结束旧流后，重新调用
+   `read_dir` 或 `walk`，从头创建新流。旧流不会自动回到起点，也不是可刷新的列表。
+3. 持续读取新流直到 `None`，处理建立流及每个项目的错误。提前结束或静默跳过
+   错误，不能作为目录完整性的证明。
+4. 若要求整次扫描得到一致集合，必须在业务层阻止其它参与者在扫描期间改变相关
+   名称。目录流不会自动排斥创建、改名或删除；新建流本身不提供快照。
+
+| 情况 | 调用方可以依赖的内容与处理方式 |
+| --- | --- |
+| 健康的本地文件系统、名称变更已完成、随后目录保持不变 | 新一次完整成功的浅层 `read_dir` 应观察变更后的直接子项；不需要额外刷新 |
+| 扫描开始前已创建的旧流，或扫描期间还有并发名称变更 | 可能观察不同时刻的条目；重新扫描不能代替业务层的一致性协调 |
+| Windows 已接受删除，但相关旧资源尚未释放 | 删除可能尚待最终完成，名称可能暂时仍被观察到或不可用；不能将删除 `Ok` 解释为立即物理回收 |
+| `DirectoryEntry.file_type_hint` 或之前查询的元信息 | 只是取得时的观察，不是实时更新；需要当前元信息时重新调用 `metadata` |
+| 要求掉电或系统崩溃后名称变更仍然存在 | 与当前进程重新枚举不同；本库没有独立目录持久化接口，文件或映射 `flush` 不提供这项保证 |
+| 网络共享、分布式或具有额外缓存一致性规则的文件系统 | 可见性还受该系统规则约束；不能把普通本地文件的结论外推到所有以 `PathBuf` 表示的位置 |
+
+`read_dir` 只枚举直接子项；`walk` 还受到深度上限、不跟随目录符号链接和目录
+类型识别的约束。对于不能提供目录项类型信息的文件系统，当前递归遍历存在可能
+遗漏目录后代的适配边界，尚未完成该类真实环境的完整性验证；浅层扫描的上述
+结论不能外推为所有文件系统上的 `walk` 都绝不漏项。重新扫描或调用文件刷新
+不能补齐这项边界。文件系统故障、权限错误也不能解释为“稍后刷新就会恢复”。
+
+下面的示例先等待创建成功，再建立并完整消费新目录流。调用方仍须保证扫描期间
+没有其它名称变更；若创建失败，示例将错误上交，不假定原目录一定未变化。
+
+```rust
+use std::path::PathBuf;
+
+use futures_lite::stream::StreamExt;
+use pi_async_fs::{DirectoryEntry, FileNamespace, LocalFileNamespace};
+
+async fn create_then_list(
+    parent: PathBuf,
+) -> pi_result::Result<Vec<DirectoryEntry<PathBuf>>> {
+    let namespace = LocalFileNamespace::new();
+    let child = parent.join("new-child");
+    if let Err(failure) = namespace.create_dir(&child).await {
+        return Err(failure.into_parts().0);
+    }
+
+    let mut stream = namespace.read_dir(parent).await?;
+    let mut entries = Vec::new();
+    while let Some(item) = stream.next().await {
+        entries.push(item?);
+    }
+    Ok(entries)
+}
+# let fixture = tempfile::tempdir().expect("建立私有目录夹具");
+# let entries = futures_lite::future::block_on(create_then_list(fixture.path().to_path_buf()))
+#     .expect("创建完成后的新扫描成功");
+# assert_eq!(entries.len(), 1);
+# assert_eq!(entries[0].name, pi_async_fs::EntryName::from(std::ffi::OsString::from("new-child")));
+```
+
 ## 写入失败恢复示例
 
 成功追加返回 `()`，不返回原始 buffer；普通失败通过 `BufferFailure<B>` 返还调用
@@ -713,7 +791,8 @@ async fn replace_then_shorten(path: PathBuf) -> pi_result::Result<()> {
 - 后续追加不会扩大既有映射的范围；
 - 映射字节只能通过透明句柄访问；
 - `ReadWriteMmapHandle::flush` 刷新映射修改，`FileIo::flush` 不会替代它；
-- `Drop` 释放句柄拥有的公开资源，但不会隐式刷新修改。
+- 最后一个实际持有者结束时，`Drop` 自动解除映射并释放相关资源，但不会隐式
+  刷新修改；只读克隆和仍在使用映射的任务可能延后最终释放。
 
 普通资源只能调用两个 `unsafe ..._uncoordinated` 映射入口。它们的 `unsafe` 表示
 调用方必须保证其它进程和所有库外访问不会破坏文件长度、身份及映射安全；它不
@@ -758,6 +837,122 @@ async fn open_coordinated_mapping(
 
 `ReadWriteMmapHandle` 可以整体移动到另一个线程，但不能共享并发写，也不能克隆。
 修改必须使用 `as_bytes_mut()`，需要可观察的刷新结果时必须显式等待 `flush()`。
+
+### 映射何时真正释放，调用方需要注意什么
+
+<a id="readme-mmap-release"></a>
+
+直白地说：**正常运行且没有其它实际持有者时，句柄被 `Drop` 后，系统已经解除
+这次映射，不是只销毁一个 Rust 外壳、留下映射等以后再清理。** 已解除的地址
+范围不再属于这次映射，相关映射资源也自动释放。不需要手动关闭映射，本库没有
+显式 `close()` 接口；正常离开作用域和主动调用 `drop(handle)` 都会执行释放。
+
+这里的“系统已经释放”指该映射已从进程地址空间移除，不等于原来的每个物理内存
+页立即变为空闲页或立即归还内存分配器。系统仍可能缓存文件内容，某些页也可能
+仍被其它映射使用；这不表示原映射还存在。进程内存统计没有立即下降，不能单独
+用来判定映射泄漏；相同数值的地址以后也可能被分配给别的用途，不能继续使用。
+
+| 持有或使用方式 | 何时允许最终解除映射 |
+| --- | --- |
+| 只读句柄没有其它克隆或在途使用 | 丢弃这个句柄时 |
+| 只读句柄还有一个或多个克隆 | 最后一个实际持有者结束时；丢弃原句柄不使其它克隆失效 |
+| 可写句柄没有仍在使用映射的操作 | 丢弃该句柄时；它不可克隆，但可以整体移到另一线程 |
+| 先丢弃打开文件的 `FileIo` 资源，映射句柄仍存在 | 映射继续有效；丢弃文件资源不等于丢弃映射 |
+| 已发起的操作仍在使用映射，调用方取消等待并丢弃句柄 | 等实际操作停止使用映射后；取消 Future 不证明操作已经结束 |
+| 将只读句柄按值交给另一文件的追加或覆盖操作 | 成功消费该值；若无其它持有者，相关使用结束后可释放；失败则返回的 `BufferFailure` 仍拥有原句柄 |
+| 将 `&ReadMmapHandle` 作为另一文件的写入来源 | 操作结束不消费调用方的原句柄；取消后已经开始的使用也可能延后最终释放 |
+| 将可写句柄借给固定读取作为目标 | 读取成功或失败都不消费调用方的句柄；调用方仍负责最终丢弃它 |
+
+尚未完成的 Future 也可能保存它收到的句柄资产；即使尚无文件副作用，只要它仍
+持有这些资产，就不能把外层变量消失当作最终释放。取消映射创建时，也不能假定
+底层从未建立过映射；已开始的创建会在不再交付句柄时自行完成资源收尾。
+为了使释放时间容易判断，应正常等待相关操作结束，处理返回的资产，再结束所有
+句柄的作用域。仅停止等待、调用 `drop(future)` 或等待一个任意时长，都不能替代
+操作已结束的证据。
+
+还有以下边界：
+
+- `as_bytes()`、`as_bytes_mut()` 及其派生切片只在对应句柄的合法借用期间有效。
+  不得保存裸地址，在句柄释放后继续访问，或用其它接口自行解除映射。
+- 最后持有者释放前，该映射仍占用范围，并继续参与同文件的操作互斥。释放其中
+  一个克隆不允许重新映射相交范围；同文件还有其它映射时，普通读取、覆盖和
+  截断也仍受原规则限制。安全删除还受其它活动文件资源约束，不能只看映射数量。
+- `Drop` 不隐式刷新，不提供刷新成功或失败的结果，也不撤销已发生的修改。
+  若业务需要确认映射修改完成同步，应先等待 `ReadWriteMmapHandle::flush()`
+  成功，再丢弃句柄；`FileIo::flush` 不替代这一步。
+- `BufferFailure<ReadMmapHandle>`、从它取回的句柄及其它拥有型容器都可能继续
+  持有映射。处理错误文本不等于释放错误值所保存的资产；取回句柄后，必须明确
+  决定重试、保留还是丢弃。写入失败和读取失败都不提供修改回滚。
+- 主动使用 `mem::forget` 等方式阻止析构，或造成永不释放的所有权，属于刻意保留
+  资源，不能要求正常 `Drop` 合同替它清理。进程被强制终止也不是正常析构路径。
+- 析构没有可供调用方接收的 I/O 错误结果。上述正常释放保证不扩大为操作系统
+  故障、任意外部破坏或不满足映射安全前提时的绝对保证，也不保证清空系统缓存。
+
+只读克隆的释放顺序如下。函数取得原句柄所有权，读完最后一个克隆后丢弃它；
+假定没有其它克隆或在途使用，这时整次映射才真正结束。
+
+```rust
+use pi_async_fs::ReadMmapHandle;
+
+fn release_shared_mapping(mapping: ReadMmapHandle) {
+    let reader = mapping.clone();
+    drop(mapping);
+
+    // 原句柄已丢弃，但 reader 仍使同一映射有效。
+    assert!(!reader.as_bytes().is_empty());
+    drop(reader);
+    // 若无其它持有者，到这里映射已解除；不能继续使用先前取得的切片或地址。
+}
+# let fixture = tempfile::tempdir().expect("建立私有映射夹具");
+# let path = fixture.path().join("mapped.bin");
+# std::fs::write(&path, b"0123456789").expect("写入夹具");
+# futures_lite::future::block_on(async {
+#     use pi_async_fs::{FileAccessMode, FileIo, FileNamespace, LocalFileNamespace, MmapRange};
+#     let namespace = LocalFileNamespace::new();
+#     let file = namespace.open(&path, FileAccessMode::ReadMmap).await.expect("打开夹具");
+#     // SAFETY: 私有夹具没有其它进程、库外访问或并发文件修改。
+#     let mapping = unsafe { file.map_read_only_uncoordinated(MmapRange::new(0, 5).unwrap()) }
+#         .await.expect("建立映射");
+#     release_shared_mapping(mapping);
+#     let reader = namespace.open(&path, FileAccessMode::Read).await.expect("打开读取资源");
+#     let mut bytes = [0_u8; 5];
+#     reader.read_exact_at(0, &mut bytes, pi_async_fs::ReadTargetRegion::full())
+#         .await.expect("最后持有者结束后恢复普通读取");
+#     assert_eq!(&bytes, b"01234");
+# });
+```
+
+下面是应用侧的“先刷新、再释放”包装，不是新增库接口。刷新失败时把错误和句柄
+一起交还调用方，以便修复原因后重试；失败不证明文件内容没有改变。若用 `?` 直接
+离开拥有句柄的函数，该句柄也可能随作用域结束而被丢弃，调用方就无法再用它重试。
+
+```rust
+use pi_async_fs::ReadWriteMmapHandle;
+
+async fn flush_then_release(
+    mut mapping: ReadWriteMmapHandle,
+) -> Result<(), (pi_result::Error, ReadWriteMmapHandle)> {
+    if let Err(error) = mapping.flush().await {
+        return Err((error, mapping));
+    }
+    drop(mapping);
+    Ok(())
+}
+# let fixture = tempfile::tempdir().expect("建立私有可写映射夹具");
+# let path = fixture.path().join("mapped.bin");
+# std::fs::write(&path, b"0123456789").expect("写入夹具");
+# futures_lite::future::block_on(async {
+#     use pi_async_fs::{FileAccessMode, FileIo, FileNamespace, LocalFileNamespace, MmapRange};
+#     let namespace = LocalFileNamespace::new();
+#     let file = namespace.open(&path, FileAccessMode::ReadWriteMmap).await.expect("打开夹具");
+#     // SAFETY: 私有夹具没有其它进程、库外访问或并发文件修改。
+#     let mut mapping = unsafe { file.map_read_write_uncoordinated(MmapRange::new(0, 5).unwrap()) }
+#         .await.expect("建立映射");
+#     mapping.as_bytes_mut().copy_from_slice(b"ABCDE");
+#     flush_then_release(mapping).await.expect("刷新成功后释放");
+# });
+# assert_eq!(std::fs::read(&path).expect("独立读取实际文件"), b"ABCDE56789");
+```
 
 ### 保留映射并追加、刷新
 
@@ -837,12 +1032,148 @@ async fn copy_without_replacement(
 
 `remove_file_uncoordinated` 和 `remove_dir_uncoordinated` 不检查本库的活动资源和
 namespace 冲突。它们仍是内存安全的 Rust API，但调用方必须自行承担操作排序；
-删除成功只表示名称绑定已解除，不保证底层数据立即物理删除、空间立即回收或所有
-既有平台句柄立即失效。
+删除成功表示名称移除已经完成，或系统已经不可逆地接受删除请求；某些平台仍
+可能等待旧资源释放后完成最终删除。不保证底层数据立即物理删除、空间立即回收、
+名称立即不可见或所有既有平台句柄立即失效。重新扫描及判断删除结果时，应结合
+上述[目录可见性边界](#readme-directory-visibility)，不能把延后删除当作缺少刷新。
+
+<a id="readme-exclusive-file-owner"></a>
+
+## 文件独占：资格、角色和释放
+
+文件独占表示：在共同协议内，同一真实文件只能由一个独占所有者及其显式派生
+资源持有。它与“该资源只能追加、读取或映射”等访问角色是两件事。可以把
+所有者理解为一份不可转借的整体使用资格，派生文件则是明确用途的独立通道；
+拿到整体资格不意味着可以用追加通道截断文件，也不意味着可以建立相交映射。
+
+### 前置条件与仲裁
+
+所有合作进程必须在任何文件创建、打开或复制首次被轮询前，配置实际指向
+**同一物理目录**的 `CrossProcessCoordinationRoot::Custom`。目录必须已经存在、
+可信且可用；相同路径文本不证明不同进程看到同一物理目录。详细配置合同见
+下节。默认 `FileParent` 不支持独占申请，返回 `Unsupported`，不会偷偷降低保证。
+默认位置上的普通文件使用仍受原有合同保护，不因此要求启用独占。
+
+| 已有状态 | 新的普通打开 | 新的独占打开 |
+| --- | --- | --- |
+| 无活动资源 | 可以申请 | 可以申请 |
+| 普通活动资源 | 可以申请，内容操作仍受原互斥约束 | 立即 `Conflict` |
+| 独占所有者或其派生资源 | 立即 `Conflict` | 立即 `Conflict` |
+
+同时申请由统一资格规则仲裁，不允许普通与独占分别检查后同时成功。规则覆盖
+同进程线程、合作进程和同一真实文件的硬链接；克隆 namespace 不能绕过它。
+申请不等待已有资源退出，不承诺公平顺序；失败后是否重试由调用方决定。
+元信息、存在性、目录枚举和空间查询并不因独占一概被禁止。
+
+这是 Windows/Linux 的共同**合作式保证**，不是阻止不合作程序访问的系统权限。
+库外原生打开或不参加协议的进程仍可能访问文件，不能据此省略映射的外部安全
+责任，也不能把独占理解为永久占有某个路径名称。
+
+### 四个入口如何组合
+
+`open_exclusive` 只打开已有普通文件并验证实际读写权限，不创建、覆盖或截断
+内容；只读权限不足以取得本地独占所有者。受既有内容授权管理的目标，应使用
+`open_exclusive_with_cross_process_authority`，普通入口不会绕过其绑定。
+
+`ExclusiveFileOwner` 不是 `FileIo`，没有隐式转换、解包、原生句柄或手动解锁
+出口。调用 `open_with_exclusive_owner`，按六种 `FileAccessMode` 显式取得
+独立资源；可为同一所有者多次派生，包括多个独立追加通道。定位符必须当前仍
+指向同一真实对象，不能拿旧所有者操作同名重建的新文件。原内容授权的名称绑定
+仍须满足，独占不自动把任意硬链接变为合法内容授权入口。
+
+派生资源继续遵守所有原有规则：映射范围不得相交；映射与普通读取、覆盖、
+截断和安全删除冲突；已经建立的映射可以与严格追加及文件刷新并存；同文件
+映射不能成为该文件追加的源。仅有独占不授予协调式安全映射资格：未经内容
+授权的资源仍只能在调用方承担外部前提后调用 `unsafe` 映射入口。
+
+普通 `copy_new` 不隐式借用独占资格；复制被独占的源须使用
+`copy_new_with_exclusive_owner`。源必须匹配所有者；目标仍必须不存在。
+复制的长度边界、完整目标发布、取消和两类失败证据与普通复制相同，不能用
+独占覆盖已有目标，也不能把失败后的证据丢弃再盲目重试。
+
+下面两个函数分别配置根和执行业务。配置必须在启动其它文件任务之前完成；
+示例接收已存在的可信根及已存在的源文件，复制目标所在目录也须存在。
+示例为缩短错误返回只取出统一错误；实际恢复流程应同时处理失败载体中的
+原始缓冲区、进度与目标/暂存证据。
+
+```rust
+use std::path::PathBuf;
+use pi_async_fs::{
+    set_cross_process_coordination_root, CrossProcessCoordinationRoot,
+    ExclusiveFileOwner, FileAccessMode, FileFlushMode, FileIo,
+    FileNamespace, LocalFileNamespace,
+};
+
+fn configure_exclusive(root: PathBuf) -> pi_result::Result<()> {
+    set_cross_process_coordination_root(CrossProcessCoordinationRoot::Custom(root))
+}
+
+async fn exclusive_append_and_copy(
+    source: PathBuf,
+    destination: PathBuf,
+) -> pi_result::Result<ExclusiveFileOwner> {
+    let namespace = LocalFileNamespace::new();
+    let owner = namespace.open_exclusive(&source).await?;
+    let mut appender = namespace
+        .open_with_exclusive_owner(&owner, &source, FileAccessMode::Append)
+        .await?;
+    appender.append(b"new record\n".to_vec())
+        .await.map_err(|failure| failure.into_parts().0)?;
+    appender.flush(FileFlushMode::DataAndMetadata).await?;
+    drop(appender);
+    namespace.copy_new_with_exclusive_owner(&owner, &source, &destination)
+        .await.map_err(|failure| failure.into_parts().0)?;
+    Ok(owner)
+}
+```
+
+返回的 Future 借用 `'a`，不要求输入本身为 `'static`。需要提交到要求
+`Send + 'static` 的外部运行时时，把 namespace、路径和所有者一起移动进
+外层异步任务，再在内部借用它们：
+
+```rust
+use std::{future::Future, path::PathBuf};
+use pi_async_fs::{ExclusiveFileOwner, FileAccessMode, FileNamespace, LocalFileNamespace};
+
+fn exclusive_owned_task(
+    namespace: LocalFileNamespace,
+    owner: ExclusiveFileOwner,
+    path: PathBuf,
+) -> impl Future<Output = pi_result::Result<()>> + Send + 'static {
+    async move {
+        let reader = namespace
+            .open_with_exclusive_owner(&owner, &path, FileAccessMode::Read)
+            .await?;
+        drop(owner);
+        // reader 仍维持独占资格；这里只放弃业务资源，不自动刷新。
+        drop(reader);
+        Ok(())
+    }
+}
+```
+
+### 生命周期、副作用与禁忌
+
+外部所有者先 `Drop` **不一定立即解除独占**。派生文件、映射、只读映射克隆、
+作为写入源保存的映射、写入失败返回的映射缓冲区，以及实际尚未完成的操作，
+都可能继续维持资格；最后一个实际拥有者退出后才释放。未轮询的 Future 不
+产生副作用；提交后取消等待不等于取消真实工作或立即解锁。取消也没有失败
+证据或原始写入缓冲区返回通道。
+
+默认 `rename` 和未协调删除不新增独占禁令；平台限制以错误返回。名称改变
+不意味着旧对象被替换，同名重建则可能是另一个对象。Linux 删除后的旧打开
+对象可继续存在；Windows 可能延后最终删除，不能把某平台结果当作跨平台
+立即删除保证。需要安全删除仍使用原安全入口，并先释放实际冲突资源。
+
+独占及派生不是纯函数或资源幂等操作，可能打开资源、产生协调资产和明确
+失败；不承诺固定 I/O 时延或零分配。`Drop` 不自动刷新文件或映射脏页，
+更不保证物理缓存立即归还；持久化继续使用相应显式刷新方法。不支持独占的
+第三方 namespace 可以保留默认关联类型和四个默认方法，它们惰性返回
+`Unsupported`，不会制造成功所有者或文件副作用。
 
 ## 跨进程协调使用边界
 
-调用方可以在第一次协调操作前设置进程级根策略：
+调用方应在任何文件创建、打开或复制首次被轮询前设置进程级根策略：
 
 ```rust
 use std::path::PathBuf;
@@ -859,8 +1190,18 @@ fn configure_coordination_root(path: PathBuf) -> pi_result::Result<()> {
 ```
 
 `Custom` 必须是非空绝对路径。成功设置只表示配置被接受，不证明目录当前存在、
-可访问或适合目标环境；这些条件会在实际建立 authority 时报告。首次协调操作后
-配置被冻结，相同表示可以幂等重复设置，不同表示返回冲突。
+可访问或适合目标环境；这些条件会在实际取得文件资源或建立 authority 时报告。
+任何本地文件创建、打开或复制首次被轮询时都会固定配置，失败也不撤销；未设置
+则固定 `FileParent`。相同表示可以幂等重复设置，不同表示返回冲突，不能先普通
+打开文件再改设 `Custom`。只创建未轮询的 Future、查询元信息、枚举目录或查询
+剩余空间不会因此固定配置。
+
+普通文件资源使用 `Custom` 时也要求指定根已经存在、可信、可写并满足支持条件；
+无法使用时明确失败，不会退回默认位置。普通创建可能先创建空目标，再在后续
+资格核验中失败；此时必须读取 `CreateFailure` 的目标证据，不能假定目标不存在。
+普通打开、创建和复制会参加共同的打开资格检查，并可能留下协调资产，但不会
+自动获得跨进程内容操作或安全映射保证。正常释放资源不会自动清理协调资产；
+不得在仍有参与者时自行删除、替换或移动它们。
 
 两个建立 authority 的函数是 `unsafe`：
 
@@ -921,8 +1262,8 @@ fn configure_capacity() -> pi_result::Result<()> {
 | namespace 元信息查询与内容操作 | 可以并存，但查询结果只是瞬时快照 |
 
 不要通过克隆或复制一个已打开文件资源创建并发通道。需要多个角色或线程独立操作
-同一文件时，每个通道都应从同一个逻辑 namespace 独立 `open`，并保留各自资源的
-所有权边界。
+同一文件时，每个通道都应从同一个逻辑 namespace 独立 `open`；持有独占时则
+通过 `open_with_exclusive_owner` 显式派生，并保留各自资源的所有权边界。
 
 ### Future 和 Stream 生命周期
 
@@ -993,6 +1334,8 @@ panic 处理正常错误。
 - 不要让同一文件的映射作为该文件自身的追加、覆盖或普通读取 buffer。
 - 不要通过映射句柄以外的引用、裸地址或其它资源访问映射范围。
 - 不要依赖映射句柄 `Drop` 或文件资源 `Drop` 自动刷新。
+- 不要把丢弃一个只读克隆、取消一个 Future 或内存统计未下降当作最终映射释放的
+  判断；必须考虑最后实际持有者，见[映射释放说明](#readme-mmap-release)。
 - 不要把 `FileIo::flush` 当作映射刷新，也不要把映射刷新当作普通文件刷新。
 - 不要从路径字符串相等或不等推导文件身份；路径别名和硬链接可能指向同一对象。
 - 不要把普通资源的同进程协调描述成跨进程安全。
@@ -1000,6 +1343,8 @@ panic 处理正常错误。
 - 不要把 authority 当作可序列化的跨进程令牌、系统权限或永久锁。
 - 不要把未协调删除解释为立即物理删除或既有句柄立即失效。
 - 不要假定 `read_dir` 或 `walk` 产生稳定顺序或目录快照。
+- 不要用旧目录流、固定延时或文件 `flush` 验证名称变更后的完整目录；应等待变更
+  完成，再建立新流并处理所有错误，同时满足相应文件系统和递归遍历边界。
 - 不要对一个 Stream 并发轮询，也不要让映射切片比句柄存活更久。
 - 不要为 `pi_atom` 使用的同一份 `pi_share` 启用 `rc` feature。
 - 不要调用当前尚不可用的远端定位符行为或假定本地适配器接受 URL。
@@ -1014,6 +1359,10 @@ cargo test --release --locked --all-features -- --test-threads=1
 cargo clippy --locked --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
 ```
+
+Linux 的真实系统调用寿命专项还要求主机已安装 `strace`，并允许跟踪本测试创建
+的子进程。受限容器或沙箱禁止该权限时，专项会明确失败，不能把它记为通过；
+应在允许调试测试子进程的环境中运行。该要求只用于测试，不是使用本库的运行条件。
 
 需要查看每个公开枚举变体、字段、泛型约束和完整签名时，可生成并打开本库
 Rustdoc：

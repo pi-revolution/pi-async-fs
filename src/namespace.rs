@@ -16,7 +16,7 @@ use crate::{
     AvailableSpace, CopyFailure, CopyOutcome, CreateDirectoriesFailure,
     CreateFailure, CrossProcessCreateSuccess, CrossProcessFileAuthority,
     DirectoryEntry, FileAccessMode, FileIo, FileLocator, FileMetadata,
-    RemoveFailure, RenameFailure, WalkEntry, WalkOptions,
+    RemoveFailure, RenameFailure, UnsupportedExclusiveFileOwner, WalkEntry, WalkOptions,
 };
 
 // 运行时无关的装箱浅层目录流。
@@ -126,8 +126,9 @@ pub type BoxWalkStream<'a, L> =
 ///
 /// 当前进程内，涉及同一父目录条目的创建、复制目标发布、安全删除和严格改名
 /// 彼此排它，冲突在产生目标副作用前立即返回而不等待；互不相关的条目不因此
-/// 全局串行。普通方法不自动协调其它进程或绕过本库的原生操作，跨进程保证只
-/// 来自显式协调式入口。
+/// 全局串行。普通方法不自动获得跨进程内容、映射或名称操作保证。标准本地
+/// 资源在使用共同 `Custom` 根时参加打开资格检查，但这不能替代显式协调式
+/// 入口，也不约束绕过本库及共同协议的原生操作。
 pub trait FileNamespace: Send + Sync {
     // 当前 namespace 接受和产生的拥有型位置值。
     //
@@ -199,6 +200,23 @@ pub trait FileNamespace: Send + Sync {
         + Send
         + Sync
         + 'static = CrossProcessFileAuthority;
+
+    /// 表示已取得某一文件独占访问资格的不透明拥有型所有者。
+    ///
+    /// 只有成功的[`Self::open_exclusive`]或
+    /// [`Self::open_exclusive_with_cross_process_authority`]才能产生有效值。
+    /// 类型相同不证明文件或命名空间相同；派生和复制仍必须核验来源与目标。
+    /// 所有者拥有必要资源，结果不借用调用栈，可跨线程移动或共享借用；
+    /// 不要求`Clone`、`Copy`、`Default`、比较、哈希或任何引用转换。
+    ///
+    /// 默认[`UnsupportedExclusiveFileOwner`]没有可构造实例，四个相关方法
+    /// 默认返回[`pi_result::ErrorKind::Unsupported`]。这是能力默认值，
+    /// 不是一个默认已取得的资源。本地实现使用[`crate::ExclusiveFileOwner`]。
+    type ExclusiveOwner: fmt::Debug
+        + fmt::Display
+        + Send
+        + Sync
+        + 'static = UnsupportedExclusiveFileOwner;
 
     // 由当前 namespace 独立打开并绑定到具体文件或远端对象的活动资源。
     //
@@ -2268,7 +2286,7 @@ pub trait FileNamespace: Send + Sync {
 
     // 以唯一访问角色独立打开一个已经存在的普通文件或远端文件对象。
     //
-    // 本方法是普通、仅进程内协调的文件资源获取入口。`locator` 先由当前
+    // 本方法是普通文件资源获取入口；内容操作仍仅进程内协调。`locator` 先由当前
     // namespace 选择并解析到一个具体 backend，`access` 再决定该 backend
     // 必须申请的最小权限和返回资源唯一获准的 [`FileAccessMode`]。成功返回
     // 的 [`Self::File`] 拥有底层资源、稳定身份登记和必要配置，不借用本次
@@ -2317,7 +2335,7 @@ pub trait FileNamespace: Send + Sync {
     //
     // # 独立资源与重复打开
     //
-    // 相同稳定文件身份的相同角色或不同角色都可以被独立打开任意次数；本
+    // 在打开资格允许时，相同稳定文件身份的相同角色或不同角色都可以被独立打开任意次数；本
     // 接口不采用“同 Locator、同角色只能打开一次”的资源生命周期限制。
     // 空闲资源不持有读取、追加、覆盖、截断或映射操作租约，因此不能只因
     // 其潜在角色阻塞另一个资源的合法操作。
@@ -2391,8 +2409,9 @@ pub trait FileNamespace: Send + Sync {
     //
     // # 普通协调域与跨进程协调域
     //
-    // 本方法只加入进程内协调域，不创建 sidecar 目录、协议文件或 `fs4` 文件
-    // 锁。通过本方法打开的映射角色可以使用相应未协调 `unsafe` 建图入口，
+    // 本方法不建立旧持久内容协议或签发authority。FileParent保持原普通域；
+    // Custom在冷取得时按真实对象加入共享打开资格，可能建立独立资格资产。
+    // 这一SH只管理资源持有，不能替代旧映射/内容协议。通过本方法打开的映射角色可以使用相应未协调 `unsafe` 建图入口，
     // 但调用安全协调式建图入口必须返回授权缺失错误，不能自动升级或静默
     // 降级。
     //
@@ -2469,11 +2488,140 @@ pub trait FileNamespace: Send + Sync {
     /// 本方法不创建、截断、映射或修改目标。成功资源拥有自身生命周期，且
     /// 只能调用所选访问模式允许的 [`FileIo`] 方法。多个资源操作同一文件时
     /// 必须分别打开；模式兼容只允许它们共存，不自动保证具体操作可并发。
+    ///
+    /// 标准本地实现首次轮询即固定全局协调根策略，失败也不撤销。使用
+    /// `Custom` 时，普通打开也要求该根实际可用，并参加共同打开资格检查；
+    /// 这不会自动授予跨进程内容协调或安全映射权限。未轮询不产生副作用；
+    /// 已提交打开被取消后，资源准备仍会安全收尾，成功但无人接收的资源会释放。
     fn open<'a>(
         &'a self,
         locator: &'a Self::Locator,
         access: FileAccessMode,
     ) -> impl Future<Output = pi_result::Result<Self::File>> + Send + 'a;
+
+    /// 非破坏性地独占打开一个已经存在的普通文件。
+    ///
+    /// `locator`借用目标位置；不创建文件或父目录，不截断、写入或映射内容。
+    /// 成功返回拥有型[`Self::ExclusiveOwner`]，验证读写权限，不等于返回
+    /// 任意读写资源。内容操作须显式调用[`Self::open_with_exclusive_owner`]；
+    /// 所有者源复制须使用[`Self::copy_new_with_exclusive_owner`]。
+    ///
+    /// # 资格与失败边界
+    ///
+    /// 标准本地实现要求所有合作参与者使用同一物理、可信且可用的`Custom`
+    /// 协调根。任何已有普通资源或另一独占所有者都会使申请立即冲突，不等待
+    /// 它们退出；独占存在时新的独立普通打开也会冲突，硬链接和同线程不例外。
+    /// 默认根或不支持后端返回`Unsupported`，不静默降级。不存在、非普通文件、
+    /// 读写权限不足、受管内容域错配或资源不足按明确错误返回，不panic。
+    /// 已有跨进程内容授权的目标应使用
+    /// [`Self::open_exclusive_with_cross_process_authority`]，本方法不绕过该绑定。
+    ///
+    /// 独占只约束共同协议的资源访问，不强制阻止不合作进程，也不永久占有
+    /// 路径名称。不自动提供安全映射；原操作互斥、改名和非协调删除语义不变。
+    /// 元信息、存在性、目录枚举和可用空间查询不因独占而一概被禁止。
+    ///
+    /// # 生命周期、副作用与成本
+    ///
+    /// Future为`Send + 'a`，只在借用期使用参数；成功结果独立拥有全部资源。
+    /// 从未轮询无副作用。本地首次轮询固定全局根策略，失败不撤销该配置。
+    /// 已提交打开被取消后仍安全收尾，无人接收的成功结果会释放；不得把取消
+    /// 当成立即解除资格。所有者Drop后派生文件、映射或实际在途操作可继续，
+    /// 最后一个实际拥有者才释放资格。
+    ///
+    /// 不是纯函数或资源幂等操作，会打开资源并可能留下协调资产。接口额外
+    /// 状态不随文件内容长度增长（`O(1)`）；路径成本随路径表示长度增长，
+    /// 底层I/O/调度延迟无固定上界，不承诺零分配或公平，不调用用户代码。
+    /// 默认实现无文件系统副作用，返回`Unsupported`。本地真实测试入口为
+    /// `tests/local_exclusive_open.rs`。
+    #[allow(clippy::manual_async_fn)]
+    fn open_exclusive<'a>(
+        &'a self,
+        locator: &'a Self::Locator,
+    ) -> impl Future<Output = pi_result::Result<Self::ExclusiveOwner>> + Send + 'a {
+        async move { Err(pi_result::error_stack::Report::new(pi_result::ErrorKind::Unsupported)) }
+    }
+
+    /// 使用既有跨进程内容授权，非破坏性地取得文件独占所有者。
+    ///
+    /// `authority`只借用当前命名空间绑定的授权。成功返回拥有型所有者，验证
+    /// 读写权限并保持原授权的目标实例、位置与协调条件；授权本身不等于独占
+    /// 资格，也不能自动绕过已存在的普通资源或独占所有者。
+    ///
+    /// 除使用授权绑定而非单独定位符外，独占范围、共同`Custom`根、错误、
+    /// 取消、最后实际拥有者释放、副作用及成本沿[`Self::open_exclusive`]。
+    /// 无效、已退役或错命名空间/对象授权明确失败，不改变原协议；所有者
+    /// 派生资源仍须遵守原安全映射前提。本方法不是新的`unsafe`授权建立入口。
+    /// 默认实现无副作用，返回`Unsupported`。Future只借用`'a`，成功结果
+    /// 拥有`'static`资源；不执行用户回调，也不因可共享借用而放宽操作互斥。
+    #[allow(clippy::manual_async_fn)]
+    fn open_exclusive_with_cross_process_authority<'a>(
+        &'a self,
+        authority: &'a Self::CrossProcessAuthority,
+    ) -> impl Future<Output = pi_result::Result<Self::ExclusiveOwner>> + Send + 'a {
+        async move { Err(pi_result::error_stack::Report::new(pi_result::ErrorKind::Unsupported)) }
+    }
+
+    /// 从已取得的文件独占所有者，显式打开一个独立的单角色文件通道。
+    ///
+    /// `owner`借用有效所有者；`locator`借用当前仍指向该所有者文件的位置；
+    /// `access`按值指定原六种访问角色之一。成功返回拥有型[`Self::File`]，
+    /// 不克隆已有数据通道，不隐式升级权限，也不修改内容。改名后的同一
+    /// 普通对象可显式提供新位置；跨进程内容授权原有名称绑定仍须满足。
+    /// 错对象、错命名空间、位置失效、权限不足或协议不符均明确失败。
+    ///
+    /// 这不是独立普通打开，不与自己的独占资格竞争。其它独立申请仍冲突；
+    /// 同一所有者可以派生多个角色通道，但映射相交、覆盖、截断、安全删除、
+    /// 同文件映射作为写源等原操作限制完全不变。映射/严格追加/文件刷新
+    /// 的既有共存合同保持。独占不自动授予跨进程安全映射。
+    ///
+    /// Future为`Send + 'a`，未轮询无副作用；已提交被取消时实际建立仍安全
+    /// 收尾。结果拥有`'static`资源，外部owner可先释放，资格保留到最后实际
+    /// 拥有者退出。不是纯函数或资源幂等操作；冷建立可产生新打开及协调资产，
+    /// 额外状态`O(1)`、位置成本随表示长度增长，I/O延迟无固定上界，不执行
+    /// 用户回调。默认实现无副作用，返回`Unsupported`。
+    #[allow(clippy::manual_async_fn)]
+    fn open_with_exclusive_owner<'a>(
+        &'a self,
+        owner: &'a Self::ExclusiveOwner,
+        locator: &'a Self::Locator,
+        access: FileAccessMode,
+    ) -> impl Future<Output = pi_result::Result<Self::File>> + Send + 'a {
+        async move { Err(pi_result::error_stack::Report::new(pi_result::ErrorKind::Unsupported)) }
+    }
+
+    /// 使用文件独占所有者的访问资格，把对应源复制为严格不替换的新目标。
+    ///
+    /// `owner`与`source`必须属于当前命名空间并指向同一真实文件对象；
+    /// `destination`必须是已有容器内尚不存在的位置。参数均只在Future借用期
+    /// 借用，不消费外部所有者。位置型[`Self::copy_new`]不能自行绕过独占，
+    /// 必须显式使用本方法；旧内容授权绑定和原复制读许可仍须满足。
+    ///
+    /// 成功及普通失败分别返回原[`CopyOutcome`]与[`CopyFailure`]，完整继承
+    /// [`Self::copy_new`]的固定源长度、完整目标可见、严格不替换、取消、
+    /// 临时资产双证据和非内容快照边界，不允许借独占覆盖既有目标。
+    /// 错源/权限/操作互斥等失败不取消owner资格；若尚未建立目标相关资产，
+    /// 证据明确为未由本次发布/未由本次创建临时资源。
+    ///
+    /// Future为`Send + 'a`，未轮询无副作用；已提交复制实际握有必要资格至
+    /// 完成或清理，取消等待不等于完成。结果不借用参数。不是纯函数或幂等
+    /// 操作；工作量至少`O(L)`，`L`为冻结源长度，搬运额外空间不随`L`线性
+    /// 增长，路径成本另计；I/O延迟无固定上界，无用户回调。默认实现无
+    /// 文件系统副作用，返回`Unsupported`及两项未创建/发布证据。
+    #[allow(clippy::manual_async_fn)]
+    fn copy_new_with_exclusive_owner<'a>(
+        &'a self,
+        owner: &'a Self::ExclusiveOwner,
+        source: &'a Self::Locator,
+        destination: &'a Self::Locator,
+    ) -> impl Future<Output = pi_result::RawResult<CopyOutcome, CopyFailure>> + Send + 'a {
+        async move {
+            Err(CopyFailure::new(
+                pi_result::error_stack::Report::new(pi_result::ErrorKind::Unsupported),
+                crate::CopyTargetEvidence::NotPublishedByOperation,
+                crate::CopyStagingEvidence::NotCreatedByOperation,
+            ))
+        }
+    }
 
     // 原子排他地创建一个空文件，并返回绑定到所选唯一访问角色的资源。
     //
@@ -2532,8 +2680,9 @@ pub trait FileNamespace: Send + Sync {
     // 都必须按稳定身份原子取得同一个协调核心，而不能形成彼此不可见的状态。
     // 成功资源直接保存该共享核心，后续 [`FileIo`] 热路径不重复查询全局表。
     //
-    // 本方法只加入普通进程内协调域，不创建 sidecar 目录、协议文件或 `fs4`
-    // 文件锁，也不返回 [`Self::CrossProcessAuthority`]。需要从创建提交点开始
+    // 本方法不建立旧持久内容协议，也不返回 [`Self::CrossProcessAuthority`]。
+    // Custom下新对象按实际创建句柄参加共享打开资格，仍保留创建后失败证据。
+    // 需要从创建提交点开始
     // 建立合作式跨进程协议时，不能先调用本方法再调用
     // [`Self::establish_cross_process_authority`]；二者之间存在不受协议保护的
     // 窗口，必须使用以后单独冻结的协调式创建入口。
@@ -2615,6 +2764,9 @@ pub trait FileNamespace: Send + Sync {
     /// 最终位置存在任何对象时失败，且不会覆盖、截断或复用它。成功结果拥有
     /// 文件资源；失败通过 [`CreateFailure`] 报告本次调用是否已创建目标。
     /// 取消发生在提交点附近时，调用方必须把目标视为可能已经创建并重新查询。
+    /// 标准本地实现首次轮询即固定协调根策略；`Custom` 根无法使用时不降级。
+    /// 若已创建目标后才失败，目标可能保留，必须依据创建证据处理，不能盲目重试。
+    /// 普通资源参加打开资格检查，不因此得到跨进程内容协调或安全映射权限。
     fn create_new<'a>(
         &'a self,
         locator: &'a Self::Locator,
@@ -2825,8 +2977,9 @@ pub trait FileNamespace: Send + Sync {
     //
     // # 进程内与跨进程协调边界
     //
-    // 本方法只加入普通进程内协调域，不接收 [`Self::CrossProcessAuthority`]，
-    // 不创建 sidecar、协议记录或 `fs4` 锁。source 稳定身份已经进入 authority
+    // 本方法不接收 [`Self::CrossProcessAuthority`]，不建立旧持久内容协议。
+    // Custom下源与真实暂存对象都在冷取得时参加共享打开资格；内容读许可
+    // 及名称协议仍独立。source稳定身份已经进入authority
     // 域，或者 destination 条目存在有效、删除中、已删除、身份冲突等协调
     // 记录时，必须返回冲突；不能自动升级或绕过协议。仅配置全局协调根并不
     // 使所有普通目标自动受管。
@@ -2891,6 +3044,9 @@ pub trait FileNamespace: Send + Sync {
     /// [`CopyFailure`] 分别说明最终目标和本次操作所管理临时资源的可证明
     /// 状态。取消后结果可能不确定，调用方不得
     /// 盲目重试。成功不隐含掉电或系统崩溃持久性保证。
+    /// 标准本地实现首次轮询即固定协调根策略，失败也不撤销。使用 `Custom`
+    /// 时源与临时资源均参加打开资格检查；根无法使用时明确失败，不降级。
+    /// 这不建立跨进程内容快照或自动协调库外修改。
     fn copy_new<'a>(
         &'a self,
         source: &'a Self::Locator,
@@ -3183,6 +3339,8 @@ pub trait FileNamespace: Send + Sync {
     /// 方法用于目标从首次可见起就必须参加跨进程协作的场景，不能由普通创建
     /// 与事后建立授权拼接出等价原子语义。失败通过 [`CreateFailure`] 报告目标
     /// 创建证据，取消后目标或协调状态可能已经提交。
+    /// 标准本地实现首次轮询即固定协调根策略；根或资格核验失败时保留真实
+    /// 创建证据，不隐式删除一个可能已被外部替换的目标。
     ///
     /// # Safety
     ///
@@ -3419,6 +3577,8 @@ pub trait FileNamespace: Send + Sync {
     /// 授权已经确定目标位置和实例，因此本方法不再接收定位符。成功前会核验
     /// 目标仍与授权匹配；删除、替换、重建或授权错配返回错误。每次成功调用
     /// 都产生独立逻辑资源，并受所选 [`FileAccessMode`] 限制。
+    /// 使用 `Custom` 时资源也参加共同打开资格检查；授权独自存活不表示仍有
+    /// 活动文件资源，不能把持有授权等同于文件已经打开。
     fn open_with_cross_process_authority<'a>(
         &'a self,
         authority: &'a Self::CrossProcessAuthority,

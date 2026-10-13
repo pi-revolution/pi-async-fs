@@ -161,3 +161,46 @@ fn test_set_cross_process_coordination_root_is_linearizable_across_threads() {
         assert_eq!(error.current_context(), &ErrorKind::Conflict);
     }
 }
+
+#[test]
+// CRV-T07/CRV-A04~05：通过原 crate 根公开出口使用纯值后，首次实际设置仍成功。
+// 合同与 CRV-ORG/DEP/CALL 三图见 .scratch/pi-async-fs-mainline/
+// EXCLUSIVE_COORDINATION_ROOT_VALUE_LAYER_PLAN_2026-10-10.md
+// #exclusive-root-value-layer-validation / #exclusive-root-value-layer-diagrams。
+// 子进程隔离真实配置，不读取/重置私有槽，不由测试代理设置行为。
+fn test_root_value_operations_do_not_freeze_process_configuration() {
+    const TEST_NAME: &str =
+        "test_root_value_operations_do_not_freeze_process_configuration";
+    if std::env::var(CHILD_CASE).as_deref() != Ok("pure-value-composition") {
+        run_current_test_in_child(TEST_NAME, "pure-value-composition");
+        return;
+    }
+
+    let parent = CrossProcessCoordinationRoot::default();
+    assert_eq!(parent, CrossProcessCoordinationRoot::FileParent);
+    assert_eq!(format!("{parent:?}"), "FileParent");
+    assert_eq!(parent.to_string(), "target file parent");
+    for path in [PathBuf::new(), PathBuf::from("relative/协调根")] {
+        let first = CrossProcessCoordinationRoot::Custom(path.clone());
+        let same = CrossProcessCoordinationRoot::Custom(path);
+        assert_eq!(first, same);
+        assert_eq!(first.partial_cmp(&same), Some(std::cmp::Ordering::Equal));
+        assert!(parent < first);
+        assert_eq!(hash_of(&first), hash_of(&same));
+        assert!(!format!("{first:?}").is_empty());
+        assert!(!first.to_string().is_empty());
+    }
+
+    let accepted = absolute_test_path("root-value-public-composition-协调根");
+    set_cross_process_coordination_root(
+        CrossProcessCoordinationRoot::Custom(accepted.clone()),
+    )
+    .expect("pure value operations must leave first configuration available");
+    set_cross_process_coordination_root(
+        CrossProcessCoordinationRoot::Custom(accepted),
+    )
+    .expect("equal accepted configuration must remain idempotent");
+    let error = set_cross_process_coordination_root(CrossProcessCoordinationRoot::FileParent)
+        .expect_err("a different strategy must remain a conflict");
+    assert_eq!(error.current_context(), &ErrorKind::Conflict);
+}

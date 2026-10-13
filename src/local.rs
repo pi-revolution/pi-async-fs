@@ -27,6 +27,8 @@ use std::fs::{
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{Read as _, SeekFrom, Write as _};
 use std::num::NonZeroUsize;
+#[cfg(windows)]
+use std::os::windows::io::AsHandle;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{
@@ -43,6 +45,9 @@ use pi_result::InteropResultExt;
 use sha2::{Digest as _, Sha256};
 
 use crate::bounded_blocking;
+use crate::file_identity::StableFileIdentity;
+use crate::open_admission_native::{CoordinationRootAnchor, OpenAdmissionKind};
+use crate::open_admission_state::OpenAdmissionState;
 use crate::{
     AvailableSpace, BufferFailure, CopyFailure, CopyOutcome,
     CopyStagingEvidence, CopyTargetEvidence,
@@ -354,17 +359,6 @@ enum LocalOverwriteOutcome {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum StableFileIdentity {
-    #[cfg(unix)]
-    Unix { device: u64, inode: u64 },
-    #[cfg(windows)]
-    Windows {
-        volume_serial_number: u64,
-        file_id: [u8; 16],
-    },
-}
-
 impl StableFileIdentity {
     fn protocol_text(&self) -> String {
         match self {
@@ -429,60 +423,6 @@ impl StableFileIdentity {
             )),
         }
     }
-
-    #[cfg(unix)]
-    fn from_std_metadata(metadata: &Metadata) -> pi_result::Result<Self> {
-        use std::os::unix::fs::MetadataExt;
-
-        if metadata.ino() == 0 {
-            return Err(pi_result::error_stack::Report::new(
-                pi_result::ErrorKind::Unsupported,
-            ));
-        }
-        Ok(Self::Unix {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-
-    #[cfg(windows)]
-    fn from_std_file(file: &std::fs::File) -> pi_result::Result<Self> {
-        use std::mem::size_of;
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
-        };
-
-        let mut information = FILE_ID_INFO::default();
-        // SAFETY: `file` 在调用期间保持有效；输出缓冲区按目标结构正确对齐，
-        // 长度与类型一致，系统调用只写入该局部缓冲区。
-        let succeeded = unsafe {
-            GetFileInformationByHandleEx(
-                file.as_raw_handle() as usize
-                    as windows_sys::Win32::Foundation::HANDLE,
-                FileIdInfo,
-                (&mut information as *mut FILE_ID_INFO).cast(),
-                size_of::<FILE_ID_INFO>() as u32,
-            )
-        };
-        if succeeded == 0 {
-            return core::result::Result::<Self, _>::Err(
-                std::io::Error::last_os_error(),
-            )
-            .into_classified_error();
-        }
-        if information.VolumeSerialNumber == 0
-            && information.FileId.Identifier.iter().all(|byte| *byte == 0)
-        {
-            return Err(pi_result::error_stack::Report::new(
-                pi_result::ErrorKind::Unsupported,
-            ));
-        }
-        Ok(Self::Windows {
-            volume_serial_number: information.VolumeSerialNumber,
-            file_id: information.FileId.Identifier,
-        })
-    }
 }
 
 struct FileCoordinationData {
@@ -524,6 +464,8 @@ struct FileCoordinationState {
     registry: &'static FileRegistry,
     data: Mutex<FileCoordinationData>,
     append_gate: Arc<async_lock::Mutex<()>>,
+    // EXO-ACQ：只有Custom实际取得才建立B04槽；沿原核心保活，不加每次IO查询。
+    open_admission: OnceLock<OpenAdmissionState>,
 }
 
 impl FileCoordinationState {
@@ -553,6 +495,7 @@ impl FileCoordinationState {
                 next_mapping_id: 1,
             }),
             append_gate: Arc::new(async_lock::Mutex::new(())),
+            open_admission: OnceLock::new(),
         }
     }
 
@@ -634,6 +577,38 @@ impl FileCoordinationState {
             .cross_process_binding
             .as_ref()
             .map(|managed| managed.binding.clone())
+    }
+
+    // EXO-LIF-F08：只在cold建立/删除时重新接上已验证凭据。原凭据可能比
+    // 活动核心活得久；同完整绑定的独立凭据必须原子汇合到当前同一核心。
+    // 临界区只处理值/Weak；原注册表持久摘要安装在放下data锁之后。
+    fn attach_cross_process_authority(
+        self: &Arc<Self>,
+        authority: Arc<CrossProcessAuthorityCore>,
+    ) -> pi_result::Result<Arc<CrossProcessAuthorityCore>> {
+        let mut data = lock_unpoisoned(&self.data);
+        if let Some(current) = data.cross_process_core.as_ref().and_then(Weak::upgrade) {
+            return if current.matches(authority.namespace_identity, &authority.binding) {
+                Ok(current)
+            } else {
+                Err(pi_result::error_stack::Report::new(pi_result::ErrorKind::Conflict))
+            };
+        }
+        if data.authority_initializing || data.ordinary_resources != 0
+            || data.exclusive_operation
+            || data.cross_process_binding.as_ref().is_some_and(|managed| managed.binding != authority.binding)
+        {
+            return Err(pi_result::error_stack::Report::new(pi_result::ErrorKind::Conflict));
+        }
+        let managed = ManagedCrossProcessBinding {
+            locator: authority.locator.clone(),
+            binding: authority.binding.clone(),
+        };
+        data.cross_process_core = Some(Arc::downgrade(&authority));
+        data.cross_process_binding = Some(managed.clone());
+        drop(data);
+        self.registry.install_cross_process_binding(&self.identity, self, managed);
+        Ok(authority)
     }
 
     fn clear_cross_process_binding(
@@ -1180,7 +1155,6 @@ pub(crate) struct CrossProcessAuthorityCore {
     namespace_identity: usize,
     locator: PathBuf,
     binding: CrossProcessProtocolBinding,
-    coordination: Arc<FileCoordinationState>,
     lifecycle_state: Mutex<CrossProcessLifecycleState>,
     lifecycle_admission: Arc<async_lock::Mutex<()>>,
     retired: AtomicBool,
@@ -1192,7 +1166,6 @@ impl CrossProcessAuthorityCore {
         namespace_identity: usize,
         locator: PathBuf,
         binding: CrossProcessProtocolBinding,
-        coordination: Arc<FileCoordinationState>,
     ) -> Self {
         let mut bytes = [0_u8; 8];
         bytes.copy_from_slice(&binding.target_incarnation[..8]);
@@ -1200,7 +1173,6 @@ impl CrossProcessAuthorityCore {
             namespace_identity,
             locator,
             binding,
-            coordination,
             lifecycle_state: Mutex::new(CrossProcessLifecycleState {
                 active_owners: 0,
                 shared_lock: None,
@@ -1228,22 +1200,37 @@ impl CrossProcessAuthorityCore {
             && self.binding == *binding
     }
 
-    async fn acquire_active_owner(
-        self: &Arc<Self>,
-    ) -> pi_result::Result<CoordinatedResourceLease> {
+    // EXO-LIF-F01：只管旧原生生命周期，不持有/依赖活动核心类型。
+    // 成功后的计数必须立即交给高层RAII租约；本出口不公开给凭据调用方。
+    // LIF-INHERITED-R01：非0观察与登记必须在同一短状态锁内完成，防止最后
+    // 释放者夹在两者之间关闭原生共享锁。原生取得/await仍在状态锁外；复用
+    // 分支不增加锁或原生工作。实证与冻结边界见R01_LIFECYCLE_RACE_DIAGNOSIS_AND_REPAIR_PROPOSAL_2026-10-13.md。
+    async fn acquire_lifecycle_owner_count(&self) -> pi_result::Result<()> {
         if self.retired.load(AtomicOrdering::Acquire) {
             return Err(pi_result::error_stack::Report::new(
                 pi_result::ErrorKind::Conflict,
             ));
         }
-        let pending = self.coordination
-            .try_reserve_coordinated_resource(self)?;
         let admission = self.lifecycle_admission.clone().lock_arc().await;
 
         let requires_lock = {
-            let state = lock_unpoisoned(&self.lifecycle_state);
-            state.active_owners == 0
+            let mut state = lock_unpoisoned(&self.lifecycle_state);
+            if state.active_owners == 0 {
+                true
+            } else {
+                state.active_owners = state.active_owners.checked_add(1)
+                    .ok_or_else(|| {
+                        pi_result::error_stack::Report::new(
+                            pi_result::ErrorKind::ResourceExhausted,
+                        )
+                    })?;
+                false
+            }
         };
+        if !requires_lock {
+            drop(admission);
+            return Ok(());
+        }
         let new_lock = if requires_lock {
             let path = self.binding.layout.lifecycle_gate.clone();
             Some(bounded_blocking::unblock_result(move || {
@@ -1268,60 +1255,8 @@ impl CrossProcessAuthorityCore {
                     )
                 })?;
         }
-        let process_lease = pending.promote()?;
         drop(admission);
-        Ok(CoordinatedResourceLease {
-            authority: Arc::clone(self),
-            process_lease: Some(process_lease),
-        })
-    }
-
-    async fn acquire_operation_owner(
-        self: &Arc<Self>,
-    ) -> pi_result::Result<CoordinatedResourceLease> {
-        if self.retired.load(AtomicOrdering::Acquire) {
-            return Err(pi_result::error_stack::Report::new(
-                pi_result::ErrorKind::Conflict,
-            ));
-        }
-        let pending = self.coordination
-            .try_reserve_coordinated_operation(self)?;
-        let admission = self.lifecycle_admission.clone().lock_arc().await;
-
-        let requires_lock = {
-            let state = lock_unpoisoned(&self.lifecycle_state);
-            state.active_owners == 0
-        };
-        let new_lock = if requires_lock {
-            let path = self.binding.layout.lifecycle_gate.clone();
-            Some(bounded_blocking::unblock_result(move || {
-                try_lock_sidecar_shared(&path)
-            })
-            .await?)
-        } else {
-            None
-        };
-
-        {
-            let mut state = lock_unpoisoned(&self.lifecycle_state);
-            if state.active_owners == 0 {
-                state.shared_lock = new_lock;
-            } else {
-                drop(new_lock);
-            }
-            state.active_owners = state.active_owners.checked_add(1)
-                .ok_or_else(|| {
-                    pi_result::error_stack::Report::new(
-                        pi_result::ErrorKind::ResourceExhausted,
-                    )
-                })?;
-        }
-        let process_lease = pending.promote()?;
-        drop(admission);
-        Ok(CoordinatedResourceLease {
-            authority: Arc::clone(self),
-            process_lease: Some(process_lease),
-        })
+        Ok(())
     }
 
     fn release_active_owner(&self) {
@@ -1342,141 +1277,156 @@ impl CrossProcessAuthorityCore {
         drop(lock_to_release);
     }
 
-    async fn acquire_read_operation(
-        self: &Arc<Self>,
-    ) -> pi_result::Result<CrossProcessReadLease> {
-        let active_owner = self.acquire_operation_owner().await?;
-        let binding = self.binding.clone();
-        let record = bounded_blocking::unblock_result(move || {
-            let _admission = try_lock_sidecar_exclusive(
-                &binding.layout.range_admission_gate,
-            )?;
-            scan_cross_process_leases(
-                &binding,
-                CrossProcessLeaseRequest::Read,
-            )?;
-            create_cross_process_lease_record(
-                &binding,
-                CrossProcessLeaseRecordKind::Read,
-            )
-        })
-        .await?;
-        Ok(CrossProcessReadLease {
-            record,
-            _active_owner: active_owner,
-        })
-    }
-
-    // 元信息与普通文件刷新均只需要内容门的共享许可。刷新不取得追加/范围门，
-    // 因而不会把其它进程的活动映射或独立追加误判为破坏性全文件访问。
-    async fn acquire_shared_content_operation(
-        self: &Arc<Self>,
-    ) -> pi_result::Result<CrossProcessSharedContentLease> {
-        let active_owner = self.acquire_operation_owner().await?;
-        let content_path = self.binding.layout.stable_content_gate.clone();
-        let content = bounded_blocking::unblock_result(move || {
-            try_lock_sidecar_shared(&content_path)
-        })
-        .await?;
-        Ok(CrossProcessSharedContentLease {
-            _content: content,
-            _active_owner: active_owner,
-        })
-    }
-
-    async fn acquire_append_operation(
-        self: &Arc<Self>,
-    ) -> pi_result::Result<CrossProcessAppendLease> {
-        let active_owner = self.acquire_operation_owner().await?;
-        let content_path = self.binding.layout.stable_content_gate.clone();
-        let append_path = self.binding.layout.append_admission_gate.clone();
-        let (content, append) = bounded_blocking::unblock_result(move || {
-            let content = try_lock_sidecar_shared(&content_path)?;
-            let append = lock_sidecar_exclusive(&append_path)?;
-            Ok::<_, pi_result::Error>((content, append))
-        })
-        .await?;
-        Ok(CrossProcessAppendLease {
-            _content: content,
-            _append: append,
-            _active_owner: active_owner,
-        })
-    }
-
-    async fn acquire_exclusive_operation(
-        self: &Arc<Self>,
-    ) -> pi_result::Result<CrossProcessExclusiveLease> {
-        let active_owner = self.acquire_operation_owner().await?;
-        let binding = self.binding.clone();
-        let (content, append, range) = bounded_blocking::unblock_result(move || {
-            let content = try_lock_sidecar_exclusive(
-                &binding.layout.stable_content_gate,
-            )?;
-            let append = try_lock_sidecar_exclusive(
-                &binding.layout.append_admission_gate,
-            )?;
-            let range = try_lock_sidecar_exclusive(
-                &binding.layout.range_admission_gate,
-            )?;
-            scan_cross_process_leases(
-                &binding,
-                CrossProcessLeaseRequest::Exclusive,
-            )?;
-            Ok::<_, pi_result::Error>((content, append, range))
-        })
-        .await?;
-        Ok(CrossProcessExclusiveLease {
-            _content: content,
-            _append: append,
-            _range: range,
-            _active_owner: active_owner,
-        })
-    }
-
-    async fn acquire_mapping_operation(
-        self: &Arc<Self>,
-        start: u64,
-        end_exclusive: u64,
-    ) -> pi_result::Result<CrossProcessMappingLease> {
-        let active_owner = self.acquire_operation_owner().await?;
-        let binding = self.binding.clone();
-        let (content, record) = bounded_blocking::unblock_result(move || {
-            let content = try_lock_sidecar_shared(
-                &binding.layout.stable_content_gate,
-            )?;
-            let _append = try_lock_sidecar_exclusive(
-                &binding.layout.append_admission_gate,
-            )?;
-            let _range = try_lock_sidecar_exclusive(
-                &binding.layout.range_admission_gate,
-            )?;
-            scan_cross_process_leases(
-                &binding,
-                CrossProcessLeaseRequest::Mapping {
-                    start,
-                    end_exclusive,
-                },
-            )?;
-            let record = create_cross_process_lease_record(
-                &binding,
-                CrossProcessLeaseRecordKind::Mapping {
-                    start,
-                    end_exclusive,
-                },
-            )?;
-            Ok::<_, pi_result::Error>((content, record))
-        })
-        .await?;
-        Ok(CrossProcessMappingLease {
-            _content: content,
-            _record: record,
-            _active_owner: active_owner,
-        })
-    }
-
     fn mark_retired(&self) {
         self.retired.store(true, AtomicOrdering::Release);
     }
+}
+
+// EXO-LIF-F03~07：高层同时消费原活动核心和凭据；下层Core不反向依赖
+// 活动类型/操作结果。调用方直接传已有核心，不在IO热路径查表或访问资格槽。
+async fn acquire_cross_process_operation_owner(
+    authority: &Arc<CrossProcessAuthorityCore>,
+    coordination: &Arc<FileCoordinationState>,
+) -> pi_result::Result<CoordinatedResourceLease> {
+    let pending = coordination.try_reserve_coordinated_operation(authority)?;
+    CoordinatedResourceLease::acquire(authority, pending).await
+}
+
+async fn acquire_cross_process_read_operation(
+    authority: &Arc<CrossProcessAuthorityCore>,
+    coordination: &Arc<FileCoordinationState>,
+) -> pi_result::Result<CrossProcessReadLease> {
+    let active_owner = acquire_cross_process_operation_owner(authority, coordination).await?;
+    let binding = authority.binding.clone();
+    let record = bounded_blocking::unblock_result(move || {
+        let _admission = try_lock_sidecar_exclusive(
+            &binding.layout.range_admission_gate,
+        )?;
+        scan_cross_process_leases(
+            &binding,
+            CrossProcessLeaseRequest::Read,
+        )?;
+        create_cross_process_lease_record(
+            &binding,
+            CrossProcessLeaseRecordKind::Read,
+        )
+    })
+    .await?;
+    Ok(CrossProcessReadLease {
+        record,
+        _active_owner: active_owner,
+    })
+}
+
+// 元信息与普通文件刷新均只需要内容门的共享许可。刷新不取得追加/范围门，
+// 因而不会把其它进程的活动映射或独立追加误判为破坏性全文件访问。
+async fn acquire_cross_process_shared_content_operation(
+    authority: &Arc<CrossProcessAuthorityCore>,
+    coordination: &Arc<FileCoordinationState>,
+) -> pi_result::Result<CrossProcessSharedContentLease> {
+    let active_owner = acquire_cross_process_operation_owner(authority, coordination).await?;
+    let content_path = authority.binding.layout.stable_content_gate.clone();
+    let content = bounded_blocking::unblock_result(move || {
+        try_lock_sidecar_shared(&content_path)
+    })
+    .await?;
+    Ok(CrossProcessSharedContentLease {
+        _content: content,
+        _active_owner: active_owner,
+    })
+}
+
+async fn acquire_cross_process_append_operation(
+    authority: &Arc<CrossProcessAuthorityCore>,
+    coordination: &Arc<FileCoordinationState>,
+) -> pi_result::Result<CrossProcessAppendLease> {
+    let active_owner = acquire_cross_process_operation_owner(authority, coordination).await?;
+    let content_path = authority.binding.layout.stable_content_gate.clone();
+    let append_path = authority.binding.layout.append_admission_gate.clone();
+    let (content, append) = bounded_blocking::unblock_result(move || {
+        let content = try_lock_sidecar_shared(&content_path)?;
+        let append = lock_sidecar_exclusive(&append_path)?;
+        Ok::<_, pi_result::Error>((content, append))
+    })
+    .await?;
+    Ok(CrossProcessAppendLease {
+        _content: content,
+        _append: append,
+        _active_owner: active_owner,
+    })
+}
+
+async fn acquire_cross_process_exclusive_operation(
+    authority: &Arc<CrossProcessAuthorityCore>,
+    coordination: &Arc<FileCoordinationState>,
+) -> pi_result::Result<CrossProcessExclusiveLease> {
+    let active_owner = acquire_cross_process_operation_owner(authority, coordination).await?;
+    let binding = authority.binding.clone();
+    let (content, append, range) = bounded_blocking::unblock_result(move || {
+        let content = try_lock_sidecar_exclusive(
+            &binding.layout.stable_content_gate,
+        )?;
+        let append = try_lock_sidecar_exclusive(
+            &binding.layout.append_admission_gate,
+        )?;
+        let range = try_lock_sidecar_exclusive(
+            &binding.layout.range_admission_gate,
+        )?;
+        scan_cross_process_leases(
+            &binding,
+            CrossProcessLeaseRequest::Exclusive,
+        )?;
+        Ok::<_, pi_result::Error>((content, append, range))
+    })
+    .await?;
+    Ok(CrossProcessExclusiveLease {
+        _content: content,
+        _append: append,
+        _range: range,
+        _active_owner: active_owner,
+    })
+}
+
+async fn acquire_cross_process_mapping_operation(
+    authority: &Arc<CrossProcessAuthorityCore>,
+    coordination: &Arc<FileCoordinationState>,
+    start: u64,
+    end_exclusive: u64,
+) -> pi_result::Result<CrossProcessMappingLease> {
+    let active_owner = acquire_cross_process_operation_owner(authority, coordination).await?;
+    let binding = authority.binding.clone();
+    let (content, record) = bounded_blocking::unblock_result(move || {
+        let content = try_lock_sidecar_shared(
+            &binding.layout.stable_content_gate,
+        )?;
+        let _append = try_lock_sidecar_exclusive(
+            &binding.layout.append_admission_gate,
+        )?;
+        let _range = try_lock_sidecar_exclusive(
+            &binding.layout.range_admission_gate,
+        )?;
+        scan_cross_process_leases(
+            &binding,
+            CrossProcessLeaseRequest::Mapping {
+                start,
+                end_exclusive,
+            },
+        )?;
+        let record = create_cross_process_lease_record(
+            &binding,
+            CrossProcessLeaseRecordKind::Mapping {
+                start,
+                end_exclusive,
+            },
+        )?;
+        Ok::<_, pi_result::Error>((content, record))
+    })
+    .await?;
+    Ok(CrossProcessMappingLease {
+        _content: content,
+        _record: record,
+        _active_owner: active_owner,
+    })
 }
 
 struct AuthorityInitializationLease {
@@ -1590,6 +1540,20 @@ impl Drop for CoordinatedProcessLease {
 struct CoordinatedResourceLease {
     authority: Arc<CrossProcessAuthorityCore>,
     process_lease: Option<CoordinatedProcessLease>,
+}
+
+impl CoordinatedResourceLease {
+    // EXO-LIF-F02：原生计数成功后立即由RAII承接，随后才promote；错误会
+    // 逆向撤销计数及预约。沿原Arc链拥有资格，不新增IO资格引用计数。
+    async fn acquire(
+        authority: &Arc<CrossProcessAuthorityCore>,
+        pending: PendingCoordinatedResource,
+    ) -> pi_result::Result<Self> {
+        authority.acquire_lifecycle_owner_count().await?;
+        let mut lease = Self { authority: Arc::clone(authority), process_lease: None };
+        lease.process_lease = Some(pending.promote()?);
+        Ok(lease)
+    }
 }
 
 struct CrossProcessReadLease {
@@ -2202,7 +2166,9 @@ fn observe_managed_target(
     if !metadata.file_type().is_file() {
         return Ok(ManagedTargetObservation::Different);
     }
-    let identity = StableFileIdentity::from_std_metadata(&metadata)?;
+    // EXO-IDQ-U01：仅传递已验证的快照，不重查/转移资源；本层函数见
+    // file_identity_query::identity_query_tests，正式 L02 调用图 IQV-CALL-001。
+    let identity = crate::file_identity_query::identity_from_metadata(&metadata)?;
     Ok(if &identity == expected {
         ManagedTargetObservation::Matching
     } else {
@@ -2232,7 +2198,9 @@ fn observe_managed_target(
         }
         Err(error) => return Err(classified_io_error(error)),
     };
-    let identity = StableFileIdentity::from_std_file(&file)?;
+    // EXO-IDQ-W01：原文件在同步调用期间保活，借用不保存/关闭；本层函数见
+    // file_identity_query::identity_query_tests，正式 L02 调用图 IQV-CALL-001。
+    let identity = crate::file_identity_query::identity_from_handle(file.as_handle())?;
     Ok(if &identity == expected {
         ManagedTargetObservation::Matching
     } else {
@@ -2356,9 +2324,6 @@ fn finish_authorized_removal(
             plan.authority.mark_retired();
             return match observation {
                 ManagedTargetObservation::Missing => {
-                    plan.authority.coordination.clear_cross_process_binding(
-                        &plan.authority.binding,
-                    );
                     Ok(())
                 }
                 ManagedTargetObservation::Matching => {
@@ -2440,9 +2405,6 @@ fn finish_authorized_removal(
             crate::RemoveTargetEvidence::RemovedByOperation,
         )
     })?;
-    plan.authority.coordination.clear_cross_process_binding(
-        &plan.authority.binding,
-    );
     drop(plan.bootstrap);
     Ok(())
 }
@@ -2704,10 +2666,14 @@ fn resolve_cross_process_layout(
     validate_coordination_filesystem(&physical_parent)?;
     let parent_identity = stable_directory_identity(&physical_parent)?;
 
+    // EXO-RCF-M01/F02~03：仅改配置出口归属；原freeze_root条件与调用时机保持。
+    // 观察None不是资格证明；本次不把新增打开期规则夹带进旧布局。
+    // 合同/RCF-T05/A02与ORG/DEP/CALL图：.scratch/pi-async-fs-mainline/
+    // EXCLUSIVE_COORDINATION_ROOT_CONFIG_LAYER_PLAN_2026-10-10.md#exclusive-root-config-layer-calls。
     let configured_root = if freeze_root {
-        Some(crate::cross_process_coordination::frozen_cross_process_coordination_root())
+        Some(crate::coordination_root_config::frozen_cross_process_coordination_root())
     } else {
-        crate::cross_process_coordination::configured_cross_process_coordination_root()
+        crate::coordination_root_config::configured_cross_process_coordination_root()
     };
     let root = match configured_root {
         None | Some(crate::CrossProcessCoordinationRoot::FileParent) => {
@@ -3137,7 +3103,9 @@ fn stable_directory_identity(path: &Path) -> pi_result::Result<StableFileIdentit
             pi_result::ErrorKind::Unsupported,
         ));
     }
-    StableFileIdentity::from_std_metadata(&metadata)
+    // EXO-IDQ-U01：原目录/链接策略保持，直接使用已取得快照；本层函数见
+    // file_identity_query::identity_query_tests，正式 L02 调用图 IQV-CALL-001。
+    crate::file_identity_query::identity_from_metadata(&metadata)
 }
 
 #[cfg(windows)]
@@ -3156,7 +3124,9 @@ fn stable_directory_identity(path: &Path) -> pi_result::Result<StableFileIdentit
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
         .into_classified_error()?;
-    StableFileIdentity::from_std_file(&file)
+    // EXO-IDQ-W01：原目录句柄保活至同步返回，不新增拥有者；本层函数见
+    // file_identity_query::identity_query_tests，正式 L02 调用图 IQV-CALL-001。
+    crate::file_identity_query::identity_from_handle(file.as_handle())
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -3561,7 +3531,7 @@ impl ContentReadGuard {
             ));
         }
         let cross_process_lease = match authority {
-            Some(authority) => Some(authority.acquire_read_operation().await?),
+            Some(authority) => Some(acquire_cross_process_read_operation(&authority, coordination).await?),
             None => None,
         };
         Ok(Self {
@@ -4498,6 +4468,253 @@ async fn create_local_directories(
     Ok(())
 }
 
+// 新增能力错误沿thiserror/pi_result分类，OS失败保留实际Interop来源。
+#[derive(Debug, pi_result::thiserror::Error)]
+enum OpenAcquisitionError {
+    #[error("exclusive opening requires a custom coordination root")]
+    CommonRootRequired,
+    #[error("native identity pin is unsupported on this platform")]
+    UnsupportedPlatform,
+}
+
+impl pi_result::ClassifyErrorKind for OpenAcquisitionError {
+    fn classify_error_kind(&self) -> pi_result::ErrorKind { pi_result::ErrorKind::Unsupported }
+}
+
+// EXO-ACQ-T01：数据文件先于活动核心释放；资格只归原核心，不新建资格Arc链。
+// 合同/三图/相关验证见EXCLUSIVE_OPEN_ACQUISITION_LAYER_2026-10-12.md。
+struct AdmittedLocalFile {
+    file: async_fs::File,
+    coordination: Arc<FileCoordinationState>,
+}
+
+impl core::fmt::Debug for AdmittedLocalFile {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.debug_struct("AdmittedLocalFile").finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Display for AdmittedLocalFile {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("AdmittedLocalFile")
+    }
+}
+
+// EXO-ACQ-F01：只接收已按角色非破坏性打开的候选；保护实际对象而非路径。
+// 普通入口在PSA切片消费本出口；原公开IO/角色不变，独占owner装配另闭合。
+fn acquire_opened_local_file(
+    locator: PathBuf,
+    file: async_fs::File,
+    coordination: Arc<FileCoordinationState>,
+    kind: OpenAdmissionKind,
+) -> impl Future<Output = pi_result::Result<AdmittedLocalFile>> + Send + 'static {
+    // 从调用即成组持有；未poll的Future也先关闭file、后释放活动核心。
+    let candidate = (file, coordination);
+    async move {
+        let root_path = match crate::coordination_root_config::frozen_cross_process_coordination_root() {
+            crate::CrossProcessCoordinationRoot::Custom(path) => path.clone(),
+            crate::CrossProcessCoordinationRoot::FileParent => {
+                if matches!(&kind, OpenAdmissionKind::Shared) {
+                    let (file, coordination) = candidate;
+                    return Ok(AdmittedLocalFile { file, coordination });
+                }
+                return Err(OpenAcquisitionError::CommonRootRequired).into_classified_error();
+            }
+        };
+        // 取消只是停止等待；这份真实完成链保活候选至准备及ensure都结束。
+        // 只在Custom冷取得提交任务，不给任何数据操作热路径增加资格工作。
+        let task = async_global_executor::spawn(async move {
+            let (candidate, prepared) = match bounded_blocking::unblock_with_input(candidate, move |candidate| {
+                let prepared = (|| {
+                    validate_coordination_filesystem(&locator)?;
+                    validate_coordination_filesystem(&root_path)?;
+                    let root = Arc::new(CoordinationRootAnchor::open(root_path)?);
+                    // 仅复制身份保活引用，不增加数据权限、不按路径重开创建对象。
+                    // 这个引用永远不读写/seek，不能用它建立任何追加数据通道。
+                    #[cfg(unix)]
+                    let pin = {
+                        use std::os::unix::io::AsFd;
+                        std::fs::File::from(candidate.0.as_fd().try_clone_to_owned().into_classified_error()?)
+                    };
+                    #[cfg(windows)]
+                    let pin = std::fs::File::from(candidate.0.as_handle().try_clone_to_owned().into_classified_error()?);
+                    #[cfg(not(any(unix, windows)))]
+                    let pin: std::fs::File = {
+                        return Err(OpenAcquisitionError::UnsupportedPlatform).into_classified_error();
+                    };
+                    Ok::<_, pi_result::Error>((root, pin))
+                })();
+                (candidate, prepared)
+            }).await {
+                Ok(value) => value,
+                Err((error, _candidate)) => return Err(error),
+            };
+            let (root, pin) = prepared?;
+            candidate.1.open_admission.get_or_init(|| {
+                OpenAdmissionState::new(candidate.1.identity.clone())
+            }).ensure(root, pin, kind).await?;
+            let (file, coordination) = candidate;
+            Ok(AdmittedLocalFile { file, coordination })
+        });
+        DetachOnDrop::new(task).await
+    }
+}
+
+// PSA-F01/PSA-DIAG-01：整个冷打开由同一拥有型完成者推进。名称预约不得
+// 留在可取消的外层Future，否则Custom候选准备尚未结束时同名已可再次修改。
+// 原角色、实际身份、旧域拒绝和登记顺序不变；只在资源取得时分离任务。
+async fn open_local_file(
+    core: &'static LocalNamespaceCore,
+    locator: PathBuf,
+    access: FileAccessMode,
+    kind: OpenAdmissionKind,
+) -> pi_result::Result<LocalFile> {
+    let entry_reservation = acquire_namespace_entry_reservation(core, &locator)
+        .await?;
+    let path_metadata = async_fs::metadata(&locator).await.into_classified_error()?;
+    if !path_metadata.is_file() {
+        return Err(pi_result::error_stack::Report::new(
+            pi_result::ErrorKind::Unsupported,
+        ));
+    }
+
+    let mut options = async_fs::OpenOptions::new();
+    match &access {
+        FileAccessMode::Read | FileAccessMode::ReadMmap => {
+            options.read(true);
+        }
+        FileAccessMode::Append => {
+            options.append(true);
+        }
+        FileAccessMode::Overwrite | FileAccessMode::Truncate => {
+            options.write(true);
+        }
+        FileAccessMode::ReadWriteMmap => {
+            options.read(true).write(true);
+        }
+    }
+    #[cfg(unix)]
+    {
+        use async_fs::unix::OpenOptionsExt;
+
+        // 防止路径在预检后被替换成FIFO等会阻塞open的特殊对象。
+        // 对常规文件，O_NONBLOCK不改变后续读写语义。
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+
+    let file = options.open(&locator).await.into_classified_error()?;
+    let metadata = file.metadata().await.into_classified_error()?;
+    if !metadata.is_file() {
+        return Err(pi_result::error_stack::Report::new(
+            pi_result::ErrorKind::Unsupported,
+        ));
+    }
+
+    let (file, identity) = stable_file_identity(file, &metadata).await?;
+    let protocol_locator = locator.clone();
+    bounded_blocking::unblock_result(move || {
+        reject_persisted_cross_process_domain(&protocol_locator)
+    })
+    .await?;
+    let coordination = core.registry.coordination_for(identity).await?;
+    let candidate = acquire_opened_local_file(
+        locator, file, coordination, kind,
+    ).await?;
+    let resource_id = core.allocate_resource_id()?;
+    candidate.coordination.register_ordinary_resource()?;
+
+    drop(entry_reservation);
+    Ok(LocalFile {
+        file: Arc::new(async_lock::Mutex::new(Some(candidate.file))),
+        access,
+        read_position: 0,
+        coordination: candidate.coordination,
+        coordinated_lease: None,
+        resource_id,
+    })
+}
+
+// CMP-F03：只消费已成功取得EX的内部资源能力，不向下传公开owner类型。
+// owner的冷引用覆盖整个真实完成链，尤其保留旧协议原活动租约，直到独立
+// 通道接管；不能只克隆coordination，否则owner先Drop可能提前撤销旧生命周期锁。
+// 每次真实独立open，绝不复制/共享追加数据通道；资格槽不再次竞争或升级。
+// 本出口自己接管拥有型完成任务；后续公开派生直接await，不叠加相同任务。
+async fn open_local_file_from_exclusive_resource(
+    namespace: &'static LocalNamespaceCore,
+    owner: Arc<LocalFile>,
+    locator: PathBuf,
+    access: FileAccessMode,
+) -> pi_result::Result<LocalFile> {
+    let task = async_global_executor::spawn(async move {
+        open_local_file_from_exclusive_resource_inner(namespace, owner, locator, access).await
+    });
+    DetachOnDrop::new(task).await
+}
+
+// 冷派生叶子只供上面真实拥有型任务调用，不能直接交付给可取消的外部Future。
+async fn open_local_file_from_exclusive_resource_inner(
+    namespace: &'static LocalNamespaceCore,
+    owner: Arc<LocalFile>,
+    locator: PathBuf,
+    access: FileAccessMode,
+) -> pi_result::Result<LocalFile> {
+    if !core::ptr::eq(owner.coordination.registry, &namespace.registry) {
+        return Err(pi_result::error_stack::Report::new(pi_result::ErrorKind::Conflict));
+    }
+    let entry_reservation = acquire_namespace_entry_reservation(namespace, &locator).await?;
+    let authority = owner.cross_process_authority();
+    let protocol_locator = locator.clone();
+    let binding = authority.as_ref().map(|authority| authority.binding.clone());
+    bounded_blocking::unblock_result(move || match binding {
+        Some(binding) => validate_published_protocol_at(&protocol_locator, &binding),
+        None => reject_persisted_cross_process_domain(&protocol_locator),
+    }).await?;
+    if !async_fs::metadata(&locator).await.into_classified_error()?.is_file() {
+        return Err(pi_result::error_stack::Report::new(pi_result::ErrorKind::Unsupported));
+    }
+    let mut options = async_fs::OpenOptions::new();
+    match &access {
+        FileAccessMode::Read | FileAccessMode::ReadMmap => { options.read(true); }
+        FileAccessMode::Append => { options.append(true); }
+        FileAccessMode::Overwrite | FileAccessMode::Truncate => { options.write(true); }
+        FileAccessMode::ReadWriteMmap => { options.read(true).write(true); }
+    }
+    #[cfg(unix)]
+    {
+        use async_fs::unix::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(&locator).await.into_classified_error()?;
+    let metadata = file.metadata().await.into_classified_error()?;
+    if !metadata.is_file() {
+        return Err(pi_result::error_stack::Report::new(pi_result::ErrorKind::Unsupported));
+    }
+    let (file, identity) = stable_file_identity(file, &metadata).await?;
+    if identity != owner.coordination.identity {
+        return Err(pi_result::error_stack::Report::new(pi_result::ErrorKind::Conflict));
+    }
+    let coordination = Arc::clone(&owner.coordination);
+    let coordinated_lease = match authority {
+        Some(authority) => Some(CoordinatedResourceLease::acquire(
+            &authority, coordination.try_reserve_coordinated_resource(&authority)?,
+        ).await?),
+        None => None,
+    };
+    let resource_id = namespace.allocate_resource_id()?;
+    if coordinated_lease.is_none() {
+        coordination.register_ordinary_resource()?;
+    }
+    drop(entry_reservation);
+    Ok(LocalFile {
+        file: Arc::new(async_lock::Mutex::new(Some(file))),
+        access,
+        read_position: 0,
+        coordination,
+        coordinated_lease,
+        resource_id,
+    })
+}
+
 async fn create_local_file(
     core: &'static LocalNamespaceCore,
     locator: PathBuf,
@@ -4601,19 +4818,23 @@ async fn create_local_file(
     let coordination = core.registry.coordination_for(identity)
         .await
         .map_err(post_create_failure)?;
+    // PSA-F02：真实新建文件参与SH；后续失败仍报告已经创建，不盲删目标。
+    let candidate = acquire_opened_local_file(
+        locator.clone(), file, coordination, OpenAdmissionKind::Shared,
+    ).await.map_err(post_create_failure)?;
     let resource_id = core
         .allocate_resource_id()
         .map_err(post_create_failure)?;
-    coordination
+    candidate.coordination
         .register_ordinary_resource()
         .map_err(post_create_failure)?;
 
     drop(entry_reservation);
     Ok(LocalFile {
-        file: Arc::new(async_lock::Mutex::new(Some(file))),
+        file: Arc::new(async_lock::Mutex::new(Some(candidate.file))),
         access,
         read_position: 0,
-        coordination,
+        coordination: candidate.coordination,
         coordinated_lease: None,
         resource_id,
     })
@@ -4721,12 +4942,16 @@ async fn create_local_file_coordinated(
     let coordination = namespace.registry.coordination_for(identity.clone())
         .await
         .map_err(after_create_failure)?;
-    let initialization = coordination
+    // 原创建句柄保活同一新对象；即使资格失败，仍保留原Published/创建证据。
+    let candidate = acquire_opened_local_file(
+        locator.clone(), creation_file, coordination, OpenAdmissionKind::Shared,
+    ).await.map_err(after_create_failure)?;
+    let initialization = candidate.coordination
         .try_begin_authority_initialization()
         .map_err(after_create_failure)?;
     let namespace_identity = namespace as *const LocalNamespaceCore as usize;
     let authority = if let Some(existing) =
-        coordination.existing_cross_process_core()
+        candidate.coordination.existing_cross_process_core()
     {
         if !existing.matches(namespace_identity, &binding)
             && !existing.retired.load(AtomicOrdering::Acquire)
@@ -4744,7 +4969,6 @@ async fn create_local_file_coordinated(
                 namespace_identity,
                 locator.clone(),
                 binding,
-                Arc::clone(&coordination),
             ))
         }
     } else {
@@ -4752,14 +4976,14 @@ async fn create_local_file_coordinated(
             namespace_identity,
             locator.clone(),
             binding,
-            Arc::clone(&coordination),
         ))
     };
     initialization
         .complete(&authority)
         .map_err(after_create_failure)?;
-    let coordinated_lease = authority
-        .acquire_active_owner()
+    let coordinated_lease = CoordinatedResourceLease::acquire(
+        &authority, candidate.coordination.try_reserve_coordinated_resource(&authority).map_err(after_create_failure)?,
+    )
         .await
         .map_err(after_create_failure)?;
 
@@ -4818,14 +5042,14 @@ async fn create_local_file_coordinated(
         .allocate_resource_id()
         .map_err(after_create_failure)?;
 
-    drop(creation_file);
+    drop(candidate.file);
     drop(bootstrap);
     drop(entry_reservation);
     let file = LocalFile {
         file: Arc::new(async_lock::Mutex::new(Some(file))),
         access,
         read_position: 0,
-        coordination,
+        coordination: candidate.coordination,
         coordinated_lease: Some(coordinated_lease),
         resource_id,
     };
@@ -4923,7 +5147,6 @@ async fn establish_local_cross_process_authority(
                 namespace_identity,
                 locator,
                 binding,
-                Arc::clone(&coordination),
             ))
         }
     } else {
@@ -4931,7 +5154,6 @@ async fn establish_local_cross_process_authority(
             namespace_identity,
             locator,
             binding,
-            Arc::clone(&coordination),
         ))
     };
     initialization.complete(&authority)?;
@@ -4944,6 +5166,7 @@ async fn open_local_file_with_cross_process_authority(
     namespace: &'static LocalNamespaceCore,
     authority: Arc<CrossProcessAuthorityCore>,
     access: FileAccessMode,
+    kind: OpenAdmissionKind,
 ) -> pi_result::Result<LocalFile> {
     let namespace_identity = namespace as *const LocalNamespaceCore as usize;
     if authority.namespace_identity != namespace_identity {
@@ -4957,7 +5180,14 @@ async fn open_local_file_with_cross_process_authority(
         &locator,
     )
     .await?;
-    let coordinated_lease = authority.acquire_active_owner().await?;
+    if authority.retired.load(AtomicOrdering::Acquire) {
+        return Err(pi_result::error_stack::Report::new(pi_result::ErrorKind::Conflict));
+    }
+    let coordination = namespace.registry.coordination_for(authority.binding.target_identity.clone()).await?;
+    let authority = coordination.attach_cross_process_authority(authority)?;
+    let coordinated_lease = CoordinatedResourceLease::acquire(
+        &authority, coordination.try_reserve_coordinated_resource(&authority)?,
+    ).await?;
 
     let validation_locator = locator.clone();
     let binding = authority.binding.clone();
@@ -5000,19 +5230,16 @@ async fn open_local_file_with_cross_process_authority(
             pi_result::ErrorKind::Conflict,
         ));
     }
-    let coordination = namespace.registry.coordination_for(identity).await?;
-    if !Arc::ptr_eq(&coordination, &authority.coordination) {
-        return Err(pi_result::error_stack::Report::new(
-            pi_result::ErrorKind::Conflict,
-        ));
-    }
+    let candidate = acquire_opened_local_file(
+        locator, file, coordination, kind,
+    ).await?;
     let resource_id = namespace.allocate_resource_id()?;
     drop(entry_reservation);
     Ok(LocalFile {
-        file: Arc::new(async_lock::Mutex::new(Some(file))),
+        file: Arc::new(async_lock::Mutex::new(Some(candidate.file))),
         access,
         read_position: 0,
-        coordination,
+        coordination: candidate.coordination,
         coordinated_lease: Some(coordinated_lease),
         resource_id,
     })
@@ -5038,14 +5265,17 @@ async fn remove_local_file_with_cross_process_authority(
     .await
     .map_err(remove_failure)?;
     let planning_authority = Arc::clone(&authority);
-    let plan = bounded_blocking::unblock_result(move || {
+    let mut plan = bounded_blocking::unblock_result(move || {
         prepare_authorized_removal(planning_authority)
     })
     .await
     .map_err(remove_failure)?;
-    let process_removal = authority
-        .coordination
-        .try_acquire_coordinated_removal(&authority)
+    // 这里只在cold删除恢复凭据到活动的联系；完成者不再从凭据反取核心。
+    let coordination = namespace.registry.coordination_for(authority.binding.target_identity.clone())
+        .await.map_err(remove_failure)?;
+    let authority = coordination.attach_cross_process_authority(authority).map_err(remove_failure)?;
+    plan.authority = Arc::clone(&authority);
+    let process_removal = coordination.try_acquire_coordinated_removal(&authority)
         .map_err(remove_failure)?;
     let result = match bounded_blocking::unblock(move || {
         finish_authorized_removal(plan)
@@ -5055,6 +5285,9 @@ async fn remove_local_file_with_cross_process_authority(
         Ok(result) => result,
         Err(error) => Err(remove_failure(error)),
     };
+    if result.is_ok() {
+        coordination.clear_cross_process_binding(&authority.binding);
+    }
     drop(process_removal);
     drop(entry_reservation);
     result
@@ -5267,7 +5500,15 @@ async fn cleanup_local_copy_staging_resource(
     expected_identity: StableFileIdentity,
     file: Option<async_fs::File>,
 ) -> CopyStagingEvidence {
-    drop(file);
+    if let Some(mut file) = file {
+        // PSA-LIF-01：异步File的Drop不能抢占已进入同步write的后台任务。
+        // 先等待Writing归位，再关闭数据句柄；原身份清理和资格租约仍在外层。
+        // 即使收尾flush失败，下层也已取回真实写者；保留原transfer首错及双证据，
+        // 不把失败暂存内容持久化作为新合同。真实公开复现见同名问题条目与
+        // test_local_public_acquisition_copy_failure_closes_real_writer_before_shared_release。
+        let _ = file.flush().await;
+        drop(file);
+    }
     let current = open_file_identity_probe(&path).await;
     let Ok((probe, identity)) = current else {
         return CopyStagingEvidence::Unknown;
@@ -5461,13 +5702,24 @@ async fn create_local_copy_staging(
                 return Err((error, evidence));
             }
         };
-        let exclusive_lease = match coordination.try_acquire_staging_exclusive() {
+        // PSA-F03：私有暂存也是实际内容资源，先SH后原排它写许可；资格
+        // 失败已关闭候选，继续只按已确认身份清理，不吞掉真实创建证据。
+        let candidate = match acquire_opened_local_file(
+            path.clone(), file, coordination, OpenAdmissionKind::Shared,
+        ).await {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                let evidence = cleanup_local_copy_staging_resource(path, identity, None).await;
+                return Err((error, evidence));
+            }
+        };
+        let exclusive_lease = match candidate.coordination.try_acquire_staging_exclusive() {
             Ok(lease) => lease,
             Err(error) => {
                 let evidence = cleanup_local_copy_staging_resource(
                     path,
                     identity,
-                    Some(file),
+                    Some(candidate.file),
                 )
                 .await;
                 return Err((error, evidence));
@@ -5477,7 +5729,7 @@ async fn create_local_copy_staging(
         return Ok(LocalCopyStaging {
             path,
             identity,
-            file: Some(file),
+            file: Some(candidate.file),
             _exclusive_lease: exclusive_lease,
             _entry_reservation: reservation,
         });
@@ -5548,7 +5800,16 @@ async fn copy_local_file(
     source: PathBuf,
     destination: PathBuf,
     cancelled: Arc<AtomicBool>,
+    owner: Option<Arc<LocalFile>>,
 ) -> pi_result::RawResult<CopyOutcome, CopyFailure> {
+    // CMP-F04：这里只继承已取得EX的显式内部能力；普通调用为None。
+    // 临时owner引用保留原协议活动租约到真实复制完成，不在传输循环查资格。
+    if owner.as_ref().is_some_and(|owner| !core::ptr::eq(owner.coordination.registry, &core.registry)) {
+        return Err(local_copy_failure(
+            pi_result::error_stack::Report::new(pi_result::ErrorKind::Conflict),
+            CopyStagingEvidence::NotCreatedByOperation,
+        ));
+    }
     let destination_reservation = acquire_namespace_entry_reservation(
         core,
         &destination,
@@ -5614,8 +5875,13 @@ async fn copy_local_file(
             )
         })?;
     let protocol_source = source.clone();
+    let source_authority = owner.as_ref().and_then(|owner| owner.cross_process_authority());
+    let source_binding = source_authority.as_ref().map(|authority| authority.binding.clone());
     bounded_blocking::unblock_result(move || {
-        reject_persisted_cross_process_domain(&protocol_source)
+        match source_binding {
+            Some(binding) => validate_published_protocol_at(&protocol_source, &binding),
+            None => reject_persisted_cross_process_domain(&protocol_source),
+        }
     })
     .await
     .map_err(|error| {
@@ -5676,7 +5942,7 @@ async fn copy_local_file(
             CopyStagingEvidence::NotCreatedByOperation,
         ));
     }
-    let (mut source_file, source_identity) = stable_file_identity(
+    let (source_file, source_identity) = stable_file_identity(
         source_file,
         &source_metadata,
     )
@@ -5687,25 +5953,46 @@ async fn copy_local_file(
                 CopyStagingEvidence::NotCreatedByOperation,
             )
         })?;
-    let source_coordination = core.registry.coordination_for(source_identity)
-        .await
-        .map_err(|error| {
+    let source_coordination = match owner.as_ref() {
+        Some(owner) => {
+            if source_identity != owner.coordination.identity {
+                return Err(local_copy_failure(
+                    pi_result::error_stack::Report::new(pi_result::ErrorKind::Conflict),
+                    CopyStagingEvidence::NotCreatedByOperation,
+                ));
+            }
+            Arc::clone(&owner.coordination)
+        }
+        None => core.registry.coordination_for(source_identity).await.map_err(|error| {
+            local_copy_failure(error, CopyStagingEvidence::NotCreatedByOperation)
+        })?,
+    };
+    // 整组源候选覆盖预读停止；不能只保留读许可而提前拆掉实际数据文件。
+    let mut source_candidate = if owner.is_some() {
+        AdmittedLocalFile { file: source_file, coordination: source_coordination }
+    } else {
+        acquire_opened_local_file(
+            source.clone(), source_file, source_coordination, OpenAdmissionKind::Shared,
+        ).await.map_err(|error| local_copy_failure(error, CopyStagingEvidence::NotCreatedByOperation))?
+    };
+    let source_lease = if owner.is_some() {
+        source_candidate.coordination.try_acquire_content_read()
+    } else {
+        source_candidate.coordination.try_acquire_uncoordinated_content_read()
+    }.map_err(|error| {
             local_copy_failure(
                 error,
                 CopyStagingEvidence::NotCreatedByOperation,
             )
         })?;
-    let source_lease = source_coordination
-        .try_acquire_uncoordinated_content_read()
-        .map_err(|error| {
-            local_copy_failure(
-                error,
-                CopyStagingEvidence::NotCreatedByOperation,
-            )
-        })?;
+    let source_cross_process_lease = match source_authority {
+        Some(authority) => Some(acquire_cross_process_read_operation(&authority, &source_candidate.coordination)
+            .await.map_err(|error| local_copy_failure(error, CopyStagingEvidence::NotCreatedByOperation))?),
+        None => None,
+    };
     drop(source_reservation);
 
-    let content_byte_len = match source_file.metadata().await.into_classified_error() {
+    let content_byte_len = match source_candidate.file.metadata().await.into_classified_error() {
         Ok(metadata) if metadata.is_file() => metadata.len(),
         Ok(_) => {
             return Err(local_copy_failure(
@@ -5732,8 +6019,9 @@ async fn copy_local_file(
     {
         Ok(staging) => staging,
         Err((error, evidence)) => {
-            drop(source_file);
+            drop(source_candidate);
             drop(source_lease);
+            drop(source_cross_process_lease);
             drop(destination_reservation);
             return Err(local_copy_failure(error, evidence));
         }
@@ -5746,7 +6034,7 @@ async fn copy_local_file(
         });
         match staging_file {
             Ok(staging_file) => transfer_local_copy_exact(
-                &mut source_file,
+                &mut source_candidate.file,
                 staging_file,
                 content_byte_len,
                 &cancelled,
@@ -5755,13 +6043,14 @@ async fn copy_local_file(
             Err(error) => Err(error),
         }
     };
-    let quiesce_result = source_file
+    let quiesce_result = source_candidate.file
         .seek(SeekFrom::Current(0))
         .await
         .map(|_| ())
         .into_classified_error();
-    drop(source_file);
+    drop(source_candidate);
     drop(source_lease);
+    drop(source_cross_process_lease);
 
     let transfer_result = match transfer_result {
         Ok(()) => quiesce_result,
@@ -5819,6 +6108,22 @@ async fn copy_local_file(
             Err(local_copy_failure(error, staging_evidence))
         }
     }
+}
+
+// CMP-F04-O01：普通和显式EX来源共用唯一生产取消/完成边界。这里只移入
+// 原copy_new既有任务和标志；取消不提前撤owner，未提交发布继续按原标志拒绝。
+async fn copy_local_file_owned(
+    core: &'static LocalNamespaceCore,
+    source: PathBuf,
+    destination: PathBuf,
+    owner: Option<Arc<LocalFile>>,
+) -> pi_result::RawResult<CopyOutcome, CopyFailure> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let task_cancelled = Arc::clone(&cancelled);
+    let task = async_global_executor::spawn(async move {
+        copy_local_file(core, source, destination, task_cancelled, owner).await
+    });
+    CancelCopyOnDrop::new(task, cancelled).await
 }
 
 fn rename_failure(error: pi_result::Error) -> RenameFailure {
@@ -6620,6 +6925,117 @@ impl Clone for LocalFileNamespace {
     }
 }
 
+/// 一个已有本地文件的、不透明的文件独占所有者。
+///
+/// 由[`FileNamespace::open_exclusive`]或
+/// [`FileNamespace::open_exclusive_with_cross_process_authority`]成功返回。
+/// 取得时验证目标的读写权限，但不创建、截断或修改内容。它本身不实现
+/// [`FileIo`]；内容访问必须通过[`FileNamespace::open_with_exclusive_owner`]
+/// 显式派生一个具有唯一访问角色的独立文件资源。源复制使用
+/// [`FileNamespace::copy_new_with_exclusive_owner`]。
+///
+/// # 独占范围与使用前提
+///
+/// 所有合作参与者必须在首次文件资源操作前设置同一物理`Custom`协调根，
+/// 并保持协调位置可信且可用。独占存在期间，本库协调域内其它普通或独占
+/// 打开会失败，包括同进程、同线程、另一个命名空间句柄及同对象的硬链接。
+/// 它不强制阻止绕过本库协议的原生访问，不永久占有路径名称，不自动授予
+/// 跨进程安全映射，也不改变改名、非协调删除的既有边界。
+///
+/// # 所有权、并发与释放
+///
+/// 本类型自动满足`Send + Sync`，可在线程间移动或共享借用，但不实现
+/// `Clone`、`Copy`、`Default`、判等、排序、哈希或序列化。无公开构造、
+/// 裸句柄、解包或提前解锁方法。`Debug`与`Display`只输出脱敏类型标签。
+///
+/// 释放此值不会使已派生文件、映射或实际在途操作失效；独占资格持续到
+/// 最后一个实际拥有者释放。Drop不隐式刷新、修改、删除文件，也不保证
+/// 物理页缓存立即归还。独占与访问角色正交，原有映射相交、覆盖、截断及
+/// 安全删除等限制仍然适用，不能借独占绕过它们。
+///
+/// 类型自身只向输出端写入固定标签，工作量和额外空间为`O(1)`，不主动查询
+/// 外部状态；调用方提供的格式化输出端可以执行代码、I/O或返回错误，其成本
+/// 和副作用另计。取得、
+/// 派生及复制的副作用、取消和成本见对应方法；测试入口为
+/// `tests/local_exclusive_open.rs`。合法安全使用不引入未定义行为，调用
+/// `unsafe`映射入口时仍必须满足该入口自己的安全前提。
+///
+/// # 类型约束示例
+///
+/// 所有者可移动和共享借用，但不能复制资源、构造默认值或直接执行文件I/O。
+/// 下列编译期例子不打开文件，也不修改全局配置。
+///
+/// ```
+/// use pi_async_fs::{ExclusiveFileOwner, UnsupportedExclusiveFileOwner};
+/// fn thread_owned<T: Send + Sync + 'static>() {}
+/// thread_owned::<ExclusiveFileOwner>();
+/// thread_owned::<UnsupportedExclusiveFileOwner>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use pi_async_fs::ExclusiveFileOwner;
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<ExclusiveFileOwner>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use pi_async_fs::ExclusiveFileOwner;
+/// fn requires_copy<T: Copy>() {}
+/// requires_copy::<ExclusiveFileOwner>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use pi_async_fs::ExclusiveFileOwner;
+/// fn requires_default<T: Default>() {}
+/// requires_default::<ExclusiveFileOwner>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use pi_async_fs::ExclusiveFileOwner;
+/// fn requires_equality<T: Eq>() {}
+/// requires_equality::<ExclusiveFileOwner>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use pi_async_fs::ExclusiveFileOwner;
+/// fn requires_order<T: Ord>() {}
+/// requires_order::<ExclusiveFileOwner>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use pi_async_fs::ExclusiveFileOwner;
+/// fn requires_hash<T: std::hash::Hash>() {}
+/// requires_hash::<ExclusiveFileOwner>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use pi_async_fs::{ExclusiveFileOwner, FileIo};
+/// fn requires_io<T: FileIo>() {}
+/// requires_io::<ExclusiveFileOwner>();
+/// ```
+///
+/// ```compile_fail
+/// use pi_async_fs::ExclusiveFileOwner;
+/// let _ = ExclusiveFileOwner {};
+/// ```
+pub struct ExclusiveFileOwner {
+    // PUB-T01：封装已验收CMP原EX资源；不公开FileIo或内部解锁能力，
+    // 不向原内容热路径加入资格字段。实际派生完成者在冷入口临时保活此资源。
+    resource: Arc<LocalFile>,
+}
+
+impl core::fmt::Debug for ExclusiveFileOwner {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.debug_struct("ExclusiveFileOwner").finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Display for ExclusiveFileOwner {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("ExclusiveFileOwner(<redacted>)")
+    }
+}
+
 /// 由本地文件命名空间独立打开的、不透明文件资源。
 ///
 /// 本类型只能通过本地命名空间的文件创建或打开操作获得。它可以在线程间移动
@@ -6668,7 +7084,7 @@ impl FileIo for LocalFile {
             let _lease = self.coordination.try_acquire_metadata_query()?;
             let _cross_process_lease = match self.cross_process_authority() {
                 Some(authority) => {
-                    Some(authority.acquire_shared_content_operation().await?)
+                    Some(acquire_cross_process_shared_content_operation(&authority, &self.coordination).await?)
                 }
                 None => None,
             };
@@ -7115,7 +7531,7 @@ impl FileIo for LocalFile {
             let append_gate = Arc::clone(&self.coordination.append_gate);
             let append_guard = append_gate.lock_arc().await;
             let cross_process_lease = match self.cross_process_authority() {
-                Some(authority) => match authority.acquire_append_operation().await {
+                Some(authority) => match acquire_cross_process_append_operation(&authority, &self.coordination).await {
                     Ok(lease) => Some(lease),
                     Err(error) => {
                         return Err(BufferFailure::new(
@@ -7154,6 +7570,9 @@ impl FileIo for LocalFile {
                     (Ok(()), Ok(())) => Ok(()),
                 };
                 *file_guard = Some(file);
+                // LIF-DEF-01：先归还/释放数据槽，再撤活动；取消且外部已Drop时
+                // 这里关闭最后数据资源，不让资格早于真实文件槽释放。
+                drop(file_guard);
                 drop(cross_process_lease);
                 drop(append_guard);
                 drop(append_lease);
@@ -7224,7 +7643,7 @@ impl FileIo for LocalFile {
                 }
             };
             let cross_process_lease = match self.cross_process_authority() {
-                Some(authority) => match authority.acquire_exclusive_operation().await {
+                Some(authority) => match acquire_cross_process_exclusive_operation(&authority, &self.coordination).await {
                     Ok(lease) => Some(lease),
                     Err(error) => {
                         return Err(OverwriteFailure::new(
@@ -7307,6 +7726,8 @@ impl FileIo for LocalFile {
                     }
                 };
                 *file_guard = Some(file);
+                // LIF-DEF-01：已有析构前移，不新增资格工作；详见本层寿命归档。
+                drop(file_guard);
                 drop(cross_process_lease);
                 drop(exclusive_lease);
                 (outcome, detached)
@@ -7347,7 +7768,7 @@ impl FileIo for LocalFile {
             let exclusive_lease = self.coordination.try_acquire_exclusive()?;
             let cross_process_lease = match self.cross_process_authority() {
                 Some(authority) => Some(
-                    authority.acquire_exclusive_operation().await?,
+                    acquire_cross_process_exclusive_operation(&authority, &self.coordination).await?,
                 ),
                 None => None,
             };
@@ -7380,6 +7801,8 @@ impl FileIo for LocalFile {
             let task = async_global_executor::spawn(async move {
                 let result = file.set_len(new_len).await;
                 *file_guard = Some(file);
+                // LIF-DEF-01：实际截断结束并归还数据槽后，才结束活动租约。
+                drop(file_guard);
                 drop(cross_process_lease);
                 drop(exclusive_lease);
                 result
@@ -7490,9 +7913,9 @@ impl FileIo for LocalFile {
 
             let pending_mapping = self.coordination
                 .try_reserve_mapping(start, end_exclusive)?;
-            let cross_process_mapping = authority
-                .acquire_mapping_operation(start, end_exclusive)
-                .await?;
+            let cross_process_mapping = acquire_cross_process_mapping_operation(
+                &authority, &self.coordination, start, end_exclusive,
+            ).await?;
             let mut file_guard = self.file.lock_arc().await;
             let file = file_guard.as_ref().ok_or_else(|| {
                 pi_result::error_stack::Report::new(
@@ -7623,9 +8046,9 @@ impl FileIo for LocalFile {
 
             let pending_mapping = self.coordination
                 .try_reserve_mapping(start, end_exclusive)?;
-            let cross_process_mapping = authority
-                .acquire_mapping_operation(start, end_exclusive)
-                .await?;
+            let cross_process_mapping = acquire_cross_process_mapping_operation(
+                &authority, &self.coordination, start, end_exclusive,
+            ).await?;
             let mut file_guard = self.file.lock_arc().await;
             let file = file_guard.as_ref().ok_or_else(|| {
                 pi_result::error_stack::Report::new(
@@ -7680,7 +8103,7 @@ impl FileIo for LocalFile {
             let flush_lease = self.coordination.try_acquire_flush()?;
             let cross_process_lease = match self.cross_process_authority() {
                 Some(authority) => Some(
-                    authority.acquire_shared_content_operation().await?,
+                    acquire_cross_process_shared_content_operation(&authority, &self.coordination).await?,
                 ),
                 None => None,
             };
@@ -7703,6 +8126,8 @@ impl FileIo for LocalFile {
                     FileFlushMode::DataAndMetadata => file.sync_all().await,
                 };
                 *file_guard = Some(file);
+                // LIF-DEF-01：同步已真实结束，先释放数据槽、后释放刷新/协调活动。
+                drop(file_guard);
                 drop(cross_process_lease);
                 drop(flush_lease);
                 result
@@ -7717,6 +8142,7 @@ impl FileIo for LocalFile {
 impl FileNamespace for LocalFileNamespace {
     type Locator = PathBuf;
     type File = LocalFile;
+    type ExclusiveOwner = ExclusiveFileOwner;
 
     fn metadata<'a>(
         &'a self,
@@ -8036,71 +8462,68 @@ impl FileNamespace for LocalFileNamespace {
         access: FileAccessMode,
     ) -> impl Future<Output = pi_result::Result<Self::File>> + Send + 'a {
         async move {
-            let entry_reservation = acquire_namespace_entry_reservation(
-                self.core,
-                locator,
-            )
-            .await?;
-            let path_metadata =
-                async_fs::metadata(locator).await.into_classified_error()?;
-            if !path_metadata.is_file() {
-                return Err(pi_result::error_stack::Report::new(
-                    pi_result::ErrorKind::Unsupported,
-                ));
-            }
+            // PSA-F01：首次资源尝试即固定策略；失败也不能在稍后另启资格域。
+            crate::coordination_root_config::frozen_cross_process_coordination_root();
+            let core = self.core;
+            let locator = locator.clone();
+            let task = async_global_executor::spawn(async move {
+                open_local_file(core, locator, access, OpenAdmissionKind::Shared).await
+            });
+            DetachOnDrop::new(task).await
+        }
+    }
 
-            let mut options = async_fs::OpenOptions::new();
-            match &access {
-                FileAccessMode::Read | FileAccessMode::ReadMmap => {
-                    options.read(true);
-                }
-                FileAccessMode::Append => {
-                    options.append(true);
-                }
-                FileAccessMode::Overwrite | FileAccessMode::Truncate => {
-                    options.write(true);
-                }
-                FileAccessMode::ReadWriteMmap => {
-                    options.read(true).write(true);
-                }
-            }
-            #[cfg(unix)]
-            {
-                use async_fs::unix::OpenOptionsExt;
+    fn open_exclusive<'a>(
+        &'a self,
+        locator: &'a Self::Locator,
+    ) -> impl Future<Output = pi_result::Result<Self::ExclusiveOwner>> + Send + 'a {
+        async move {
+            // PUB-F01：公开首poll固定策略；原拥有任务覆盖完整CMP-F01。
+            // owner只包装已完成的EX资源，普通文件不能被外部伪装成所有者。
+            crate::coordination_root_config::frozen_cross_process_coordination_root();
+            let core = self.core;
+            let locator = locator.clone();
+            let task = async_global_executor::spawn(async move {
+                open_local_file(core, locator, FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive).await
+            });
+            let resource = DetachOnDrop::new(task).await?;
+            Ok(ExclusiveFileOwner { resource: Arc::new(resource) })
+        }
+    }
 
-                // 防止路径在预检后被替换成 FIFO 等会阻塞 open 的特殊对象。
-                // 对常规文件，`O_NONBLOCK` 不改变后续读写语义。
-                options.custom_flags(libc::O_NONBLOCK);
-            }
+    fn open_exclusive_with_cross_process_authority<'a>(
+        &'a self,
+        authority: &'a Self::CrossProcessAuthority,
+    ) -> impl Future<Output = pi_result::Result<Self::ExclusiveOwner>> + Send + 'a {
+        async move {
+            // PUB-F02：原凭据核验与活动租约仍由CMP-F02负责；公开壳只拥有
+            // 输入并提交完整冷任务，不把凭据本身当独占或安全映射的新增授权。
+            crate::coordination_root_config::frozen_cross_process_coordination_root();
+            let namespace = self.core;
+            let authority = Arc::clone(authority.local_core());
+            let task = async_global_executor::spawn(async move {
+                open_local_file_with_cross_process_authority(
+                    namespace, authority, FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive,
+                ).await
+            });
+            let resource = DetachOnDrop::new(task).await?;
+            Ok(ExclusiveFileOwner { resource: Arc::new(resource) })
+        }
+    }
 
-            let file = options.open(locator).await.into_classified_error()?;
-            let metadata = file.metadata().await.into_classified_error()?;
-            if !metadata.is_file() {
-                return Err(pi_result::error_stack::Report::new(
-                    pi_result::ErrorKind::Unsupported,
-                ));
-            }
-
-            let (file, identity) = stable_file_identity(file, &metadata).await?;
-            let protocol_locator = locator.clone();
-            bounded_blocking::unblock_result(move || {
-                reject_persisted_cross_process_domain(&protocol_locator)
-            })
-            .await?;
-            let coordination = self.core.registry.coordination_for(identity)
-                .await?;
-            let resource_id = self.core.allocate_resource_id()?;
-            coordination.register_ordinary_resource()?;
-
-            drop(entry_reservation);
-            Ok(LocalFile {
-                file: Arc::new(async_lock::Mutex::new(Some(file))),
-                access,
-                read_position: 0,
-                coordination,
-                coordinated_lease: None,
-                resource_id,
-            })
+    fn open_with_exclusive_owner<'a>(
+        &'a self,
+        owner: &'a Self::ExclusiveOwner,
+        locator: &'a Self::Locator,
+        access: FileAccessMode,
+    ) -> impl Future<Output = pi_result::Result<Self::File>> + Send + 'a {
+        async move {
+            // PUB-F03：只从不透明owner取得原EX资源；CMP-F03自己拥有完整
+            // 冷完成任务，禁止此处重复spawn或只把coordination传给异步叶子。
+            crate::coordination_root_config::frozen_cross_process_coordination_root();
+            open_local_file_from_exclusive_resource(
+                self.core, Arc::clone(&owner.resource), locator.clone(), access,
+            ).await
         }
     }
 
@@ -8113,6 +8536,8 @@ impl FileNamespace for LocalFileNamespace {
     > + Send
            + 'a {
         async move {
+            // PSA-F02：公开首poll固定，不让内部任务调度延后配置线性化。
+            crate::coordination_root_config::frozen_cross_process_coordination_root();
             let core = self.core;
             let locator = locator.clone();
             let task = async_global_executor::spawn(async move {
@@ -8131,21 +8556,28 @@ impl FileNamespace for LocalFileNamespace {
     > + Send
            + 'a {
         async move {
+            // PSA-F03：复制源/暂存参与同一域，首次poll就固定唯一根策略。
+            crate::coordination_root_config::frozen_cross_process_coordination_root();
             let core = self.core;
             let source = source.clone();
             let destination = destination.clone();
-            let cancelled = Arc::new(AtomicBool::new(false));
-            let task_cancelled = Arc::clone(&cancelled);
-            let task = async_global_executor::spawn(async move {
-                copy_local_file(
-                    core,
-                    source,
-                    destination,
-                    task_cancelled,
-                )
-                .await
-            });
-            CancelCopyOnDrop::new(task, cancelled).await
+            copy_local_file_owned(core, source, destination, None).await
+        }
+    }
+
+    fn copy_new_with_exclusive_owner<'a>(
+        &'a self,
+        owner: &'a Self::ExclusiveOwner,
+        source: &'a Self::Locator,
+        destination: &'a Self::Locator,
+    ) -> impl Future<Output = pi_result::RawResult<CopyOutcome, CopyFailure>> + Send + 'a {
+        async move {
+            // PUB-F04：共同复制完成入口已有取消标志/拥有任务；只在冷壳
+            // 显式传原EX资源，原源身份/长度/暂存/取消/发布/双证据全由其负责。
+            crate::coordination_root_config::frozen_cross_process_coordination_root();
+            copy_local_file_owned(
+                self.core, source.clone(), destination.clone(), Some(Arc::clone(&owner.resource)),
+            ).await
         }
     }
 
@@ -8164,6 +8596,7 @@ impl FileNamespace for LocalFileNamespace {
     > + Send
            + 'a {
         async move {
+            crate::coordination_root_config::frozen_cross_process_coordination_root();
             let namespace = self.core;
             let task = async_global_executor::spawn(async move {
                 create_local_file_coordinated(namespace, locator, access).await
@@ -8199,6 +8632,7 @@ impl FileNamespace for LocalFileNamespace {
         access: FileAccessMode,
     ) -> impl Future<Output = pi_result::Result<Self::File>> + Send + 'a {
         async move {
+            crate::coordination_root_config::frozen_cross_process_coordination_root();
             let namespace = self.core;
             let authority = Arc::clone(authority.local_core());
             let task = async_global_executor::spawn(async move {
@@ -8206,6 +8640,7 @@ impl FileNamespace for LocalFileNamespace {
                     namespace,
                     authority,
                     access,
+                    OpenAdmissionKind::Shared,
                 )
                 .await
             });
@@ -8515,5 +8950,1654 @@ mod namespace_entry_registry_tests {
                 &pi_result::ErrorKind::Conflict,
             ),
         }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", windows)))]
+mod exclusive_open_tests {
+    use super::*;
+    use crate::open_admission_native::{CoordinationRootAnchor, OpenAdmissionKind, OwnedOpenAdmission};
+    use futures_lite::future::block_on;
+
+    // 真实小夹具不代理生产功能；Linux磁盘临时区自动清理，Windows项目target。
+    fn fixture() -> tempfile::TempDir {
+        #[cfg(target_os = "linux")]
+        { tempfile::Builder::new().prefix("pi-async-fs-acquire-").tempdir().unwrap() }
+        #[cfg(windows)]
+        {
+            let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("exclusive-open-fixtures");
+            std::fs::create_dir_all(&directory).unwrap();
+            tempfile::Builder::new().prefix("acquire-").tempdir_in(directory).unwrap()
+        }
+    }
+
+    // 每用例只隔离配置，不重置生产全局状态；失败/超时都回收子进程。
+    fn isolated(test_name: &str) -> bool {
+        const ENVIRONMENT: &str = "PI_ASYNC_FS_EXCLUSIVE_OPEN_TEST_CHILD";
+        if std::env::var(ENVIRONMENT).as_deref() == Ok(test_name) { return false; }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(format!("local::exclusive_open_tests::{test_name}"))
+            .arg("--exact").arg("--nocapture")
+            .env(ENVIRONMENT, test_name)
+            .env("BLOCKING_MAX_THREADS", "1")
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+            .spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!("exclusive child timed out: {}", String::from_utf8_lossy(&output.stderr));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "child failed\n{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("1 passed; 0 failed; 0 ignored"));
+        assert!(stdout.contains("EXCLUSIVE_CHILD_VERIFIED"));
+        print!("{stdout}");
+        true
+    }
+
+    // 只准备既有打开结果/真实身份/实际注册表对象，供获准私有接缝使用。
+    async fn opened(path: &Path) -> (async_fs::File, Arc<FileCoordinationState>) {
+        let file = async_fs::File::open(path).await.unwrap();
+        let metadata = file.metadata().await.unwrap();
+        let (file, identity) = stable_file_identity(file, &metadata).await.unwrap();
+        let namespace = LocalFileNamespace::new();
+        let coordination = namespace.core.registry.coordination_for(identity).await.unwrap();
+        (file, coordination)
+    }
+
+    // 按冻结六角色准备真实拥有型输入，不实现公开open或任何文件IO行为。
+    async fn opened_role(path: &Path, access: FileAccessMode) -> (async_fs::File, Arc<FileCoordinationState>) {
+        let mut options = async_fs::OpenOptions::new();
+        match access {
+            FileAccessMode::Read | FileAccessMode::ReadMmap => { options.read(true); }
+            FileAccessMode::Append => { options.append(true); }
+            FileAccessMode::Overwrite | FileAccessMode::Truncate => { options.write(true); }
+            FileAccessMode::ReadWriteMmap => { options.read(true).write(true); }
+        }
+        let file = options.open(path).await.unwrap();
+        let metadata = file.metadata().await.unwrap();
+        let (file, identity) = stable_file_identity(file, &metadata).await.unwrap();
+        let namespace = LocalFileNamespace::new();
+        let coordination = namespace.core.registry.coordination_for(identity).await.unwrap();
+        (file, coordination)
+    }
+
+    // ACQ-T01：候选输出持有真实资格，独立原生EX探针被拒绝；候选最后
+    // Drop后原核心回收/EX可取得。文件内容和固定空载体独立核验。
+    #[test]
+    fn test_local_open_acquisition_owns_qualification_until_candidate_drop() {
+        if isolated("test_local_open_acquisition_owns_qualification_until_candidate_drop") { return; }
+        let temporary = fixture();
+        let path = temporary.path().join("data.bin");
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(&path, b"acquisition-original").unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let (file, coordination) = block_on(opened(&path));
+        let weak = Arc::downgrade(&coordination);
+        let candidate = block_on(acquire_opened_local_file(path.clone(), file, coordination, OpenAdmissionKind::Shared)).unwrap();
+        let root = Arc::new(CoordinationRootAnchor::open(root_path.clone()).unwrap());
+        assert_eq!(OwnedOpenAdmission::try_acquire(
+            Arc::clone(&root), std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive,
+        ).unwrap_err().current_context(), &pi_result::ErrorKind::Conflict);
+        assert_eq!(std::fs::read(&path).unwrap(), b"acquisition-original");
+        drop(candidate);
+        assert!(weak.upgrade().is_none(), "no inactive credential or history keeps this object alive");
+        drop(OwnedOpenAdmission::try_acquire(
+            root, std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive,
+        ).expect("candidate drop releases qualification"));
+        let entries = std::fs::read_dir(&root_path).unwrap().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].as_ref().unwrap().metadata().unwrap().len(), 0);
+        println!("EXCLUSIVE_CHILD_VERIFIED candidate-drop");
+    }
+
+    // ACQ-T04/T06：仅候选接缝的未poll不固定策略；默认普通取得不创建
+    // 协调资产，实际首次取得固定默认，之后不能改Custom。默认独占明确拒绝。
+    #[test]
+    fn test_local_open_acquisition_default_shared_is_lazy_and_exclusive_is_unsupported() {
+        if isolated("test_local_open_acquisition_default_shared_is_lazy_and_exclusive_is_unsupported") { return; }
+        fn traits<T: Send + Sync + 'static>() {}
+        traits::<AdmittedLocalFile>();
+        let temporary = fixture();
+        let path = temporary.path().join("data.bin");
+        std::fs::write(&path, b"default-original").unwrap();
+        let (file, coordination) = block_on(opened(&path));
+        drop(acquire_opened_local_file(path.clone(), file, coordination, OpenAdmissionKind::Shared));
+        assert!(crate::coordination_root_config::configured_cross_process_coordination_root().is_none());
+        let (file, coordination) = block_on(opened(&path));
+        let candidate = block_on(acquire_opened_local_file(path.clone(), file, coordination, OpenAdmissionKind::Shared))
+            .expect("default ordinary candidate preserves prior behavior");
+        assert_eq!(format!("{candidate:?}"), "AdmittedLocalFile { .. }");
+        assert_eq!(format!("{candidate}"), "AdmittedLocalFile");
+        println!("ACQUISITION_LAYOUT coordination={} inline_slot={} candidate={}",
+            core::mem::size_of::<FileCoordinationState>(),
+            core::mem::size_of::<OnceLock<OpenAdmissionState>>(),
+            core::mem::size_of::<AdmittedLocalFile>());
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
+        assert_eq!(crate::coordination_root_config::configured_cross_process_coordination_root(), Some(&crate::CrossProcessCoordinationRoot::FileParent));
+        assert_eq!(crate::set_cross_process_coordination_root(
+            crate::CrossProcessCoordinationRoot::Custom(temporary.path().join("late-root")),
+        ).unwrap_err().current_context(), &pi_result::ErrorKind::Conflict);
+        let (file, coordination) = block_on(opened(&path));
+        assert_eq!(block_on(acquire_opened_local_file(path.clone(), file, coordination, OpenAdmissionKind::Exclusive))
+            .unwrap_err().current_context(), &pi_result::ErrorKind::Unsupported);
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), b"default-original");
+        drop(candidate);
+        println!("EXCLUSIVE_CHILD_VERIFIED default-and-lazy");
+    }
+
+    // ACQ-T02：独占/共享拒绝覆盖同路径及跨目录硬链接；错误真实文件
+    // 不能套用别的核心。每种失败都保持原所有者/内容，最后Drop后真实可重试。
+    #[test]
+    fn test_local_open_acquisition_conflicts_follow_actual_objects_and_reject_wrong_core() {
+        if isolated("test_local_open_acquisition_conflicts_follow_actual_objects_and_reject_wrong_core") { return; }
+        let temporary = fixture();
+        let path = temporary.path().join("data.bin");
+        let other = temporary.path().join("other.bin");
+        let alias_directory = temporary.path().join("aliases");
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::create_dir(&alias_directory).unwrap();
+        let alias = alias_directory.join("alias.bin");
+        std::fs::write(&path, b"owned-original").unwrap();
+        std::fs::write(&other, b"other-original").unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let (file, coordination) = block_on(opened_role(&path, FileAccessMode::ReadWriteMmap));
+        let exclusive = block_on(acquire_opened_local_file(path.clone(), file, coordination, OpenAdmissionKind::Exclusive)).unwrap();
+        for locator in [&path, &alias] {
+            for kind in [OpenAdmissionKind::Shared, OpenAdmissionKind::Exclusive] {
+                let (file, coordination) = block_on(opened(locator));
+                assert_eq!(block_on(acquire_opened_local_file(locator.clone(), file, coordination, kind))
+                    .unwrap_err().current_context(), &pi_result::ErrorKind::Conflict);
+            }
+        }
+        drop(exclusive);
+        let (file, coordination) = block_on(opened(&alias));
+        let first_shared = block_on(acquire_opened_local_file(alias.clone(), file, coordination, OpenAdmissionKind::Shared)).unwrap();
+        let (file, coordination) = block_on(opened(&path));
+        let second_shared = block_on(acquire_opened_local_file(path.clone(), file, coordination, OpenAdmissionKind::Shared)).unwrap();
+        let (wrong_file, wrong_coordination) = block_on(opened(&other));
+        let rejected = block_on(acquire_opened_local_file(other.clone(), wrong_file, Arc::clone(&first_shared.coordination), OpenAdmissionKind::Shared))
+            .unwrap_err();
+        assert_eq!(rejected.current_context(), &pi_result::ErrorKind::Conflict);
+        drop(wrong_coordination);
+        drop(first_shared);
+        let root = Arc::new(CoordinationRootAnchor::open(root_path).unwrap());
+        assert_eq!(OwnedOpenAdmission::try_acquire(
+            Arc::clone(&root), std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive,
+        ).unwrap_err().current_context(), &pi_result::ErrorKind::Conflict);
+        drop(second_shared);
+        drop(OwnedOpenAdmission::try_acquire(
+            root, std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive,
+        ).expect("last shared candidate release"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"owned-original");
+        assert_eq!(std::fs::read(&other).unwrap(), b"other-original");
+        println!("EXCLUSIVE_CHILD_VERIFIED aliases-and-conflicts");
+    }
+
+    // ACQ-T03：六种真实数据打开权限都能取得SH，保持同对象资格至最后
+    // 候选释放；输入均独立open，测试不克隆数据通道、不执行模拟文件IO。
+    #[test]
+    fn test_local_open_acquisition_accepts_all_existing_role_permissions() {
+        if isolated("test_local_open_acquisition_accepts_all_existing_role_permissions") { return; }
+        let temporary = fixture();
+        let path = temporary.path().join("data.bin");
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(&path, b"roles-original").unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let mut candidates = Vec::new();
+        for role in [FileAccessMode::Read, FileAccessMode::Append, FileAccessMode::Overwrite,
+            FileAccessMode::Truncate, FileAccessMode::ReadMmap, FileAccessMode::ReadWriteMmap] {
+            let (file, coordination) = block_on(opened_role(&path, role));
+            candidates.push(block_on(acquire_opened_local_file(path.clone(), file, coordination, OpenAdmissionKind::Shared)).unwrap());
+        }
+        let root = Arc::new(CoordinationRootAnchor::open(root_path.clone()).unwrap());
+        for _ in 0..5 {
+            drop(candidates.pop().unwrap());
+            assert_eq!(OwnedOpenAdmission::try_acquire(
+                Arc::clone(&root), std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive,
+            ).unwrap_err().current_context(), &pi_result::ErrorKind::Conflict);
+        }
+        drop(candidates);
+        drop(OwnedOpenAdmission::try_acquire(
+            root, std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive,
+        ).expect("last of all role candidates releases qualification"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"roles-original");
+        assert_eq!(std::fs::read_dir(root_path).unwrap().count(), 1);
+        println!("EXCLUSIVE_CHILD_VERIFIED role-permissions");
+    }
+
+    // ACQ-T03：真实Linux权限0222使新只读打开失败，但只追加打开可用；
+    // 候选取得必须不再申请读权限。先恢复权限再断言，避免失败污染夹具清理。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_local_open_acquisition_write_only_file_requires_no_additional_read_permission() {
+        if isolated("test_local_open_acquisition_write_only_file_requires_no_additional_read_permission") { return; }
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = fixture();
+        let path = temporary.path().join("write-only.bin");
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(&path, b"write-only-original").unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path)).unwrap();
+        let permissions = std::fs::metadata(&path).unwrap().permissions();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o222)).unwrap();
+        let read_attempt = std::fs::File::open(&path);
+        let acquired = block_on(async {
+            let (file, coordination) = opened_role(&path, FileAccessMode::Append).await;
+            acquire_opened_local_file(path.clone(), file, coordination, OpenAdmissionKind::Shared).await
+        });
+        std::fs::set_permissions(&path, permissions).unwrap();
+        assert_eq!(read_attempt.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied,
+            "test requires a real unprivileged process and denied read permission");
+        drop(acquired.expect("append-only candidate must not request additional read access"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"write-only-original");
+        println!("EXCLUSIVE_CHILD_VERIFIED no-extra-read-permission");
+    }
+
+    // ACQ-T05：同一Custom配置经过不存在→普通文件→真实目录；错误不回滚
+    // 配置、不回退、不改源文件。非空载体拒绝且原样保留，离线修复后可重试。
+    #[test]
+    fn test_local_open_acquisition_root_and_carrier_failures_are_retryable_without_fallback() {
+        if isolated("test_local_open_acquisition_root_and_carrier_failures_are_retryable_without_fallback") { return; }
+        let temporary = fixture();
+        let path = temporary.path().join("data.bin");
+        let root_path = temporary.path().join("coordination");
+        std::fs::write(&path, b"failure-original").unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let (file, coordination) = block_on(opened(&path));
+        let retained = Arc::clone(&coordination);
+        assert_eq!(block_on(acquire_opened_local_file(path.clone(), file, coordination, OpenAdmissionKind::Shared))
+            .unwrap_err().current_context(), &pi_result::ErrorKind::NotFound);
+        assert!(!root_path.exists());
+        std::fs::write(&root_path, b"not-a-directory").unwrap();
+        let file = block_on(async_fs::File::open(&path)).unwrap();
+        assert_eq!(block_on(acquire_opened_local_file(path.clone(), file, Arc::clone(&retained), OpenAdmissionKind::Shared))
+            .unwrap_err().current_context(), &pi_result::ErrorKind::Unsupported);
+        assert_eq!(std::fs::read(&root_path).unwrap(), b"not-a-directory");
+        std::fs::remove_file(&root_path).unwrap();
+        std::fs::create_dir(&root_path).unwrap();
+        let file = block_on(async_fs::File::open(&path)).unwrap();
+        drop(block_on(acquire_opened_local_file(path.clone(), file, retained, OpenAdmissionKind::Shared))
+            .expect("same object retries after directory correction"));
+        let carriers = std::fs::read_dir(&root_path).unwrap().map(|entry| entry.unwrap().path()).collect::<Vec<_>>();
+        assert_eq!(carriers.len(), 1);
+        std::fs::write(&carriers[0], b"corrupt-carrier").unwrap();
+        let (file, coordination) = block_on(opened(&path));
+        let retained = Arc::clone(&coordination);
+        assert_eq!(block_on(acquire_opened_local_file(path.clone(), file, coordination, OpenAdmissionKind::Shared))
+            .unwrap_err().current_context(), &pi_result::ErrorKind::Corrupted);
+        assert_eq!(std::fs::read(&carriers[0]).unwrap(), b"corrupt-carrier");
+        std::fs::write(&carriers[0], []).unwrap();
+        let file = block_on(async_fs::File::open(&path)).unwrap();
+        drop(block_on(acquire_opened_local_file(path.clone(), file, retained, OpenAdmissionKind::Shared))
+            .expect("same state retries after offline carrier correction"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"failure-original");
+        assert_eq!(std::fs::metadata(&carriers[0]).unwrap().len(), 0);
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 2);
+        assert_eq!(crate::coordination_root_config::configured_cross_process_coordination_root(),
+            Some(&crate::CrossProcessCoordinationRoot::Custom(root_path)));
+        println!("EXCLUSIVE_CHILD_VERIFIED root-and-carrier-failures");
+    }
+
+    // ACQ-T05：Linux真实procfs/Windows明确不支持的UNC根在建立资格前
+    // 拒绝；源目录不出现替代载体，不能偷偷回退同级目录以伪装成功。
+    #[test]
+    fn test_local_open_acquisition_unsupported_root_never_falls_back() {
+        if isolated("test_local_open_acquisition_unsupported_root_never_falls_back") { return; }
+        let temporary = fixture();
+        let path = temporary.path().join("data.bin");
+        std::fs::write(&path, b"unsupported-original").unwrap();
+        #[cfg(target_os = "linux")]
+        let unsupported = PathBuf::from("/proc");
+        #[cfg(windows)]
+        let unsupported = PathBuf::from(r"\\pi-async-fs-no-server\not-a-share\coordination");
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(unsupported)).unwrap();
+        let (file, coordination) = block_on(opened(&path));
+        assert_eq!(block_on(acquire_opened_local_file(path.clone(), file, coordination, OpenAdmissionKind::Shared))
+            .unwrap_err().current_context(), &pi_result::ErrorKind::Unsupported);
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), b"unsupported-original");
+        println!("EXCLUSIVE_CHILD_VERIFIED unsupported-no-fallback");
+    }
+
+    // ACQ-T05：真实容量一耗尽时，候选未交付/未建载体；原对象仍可在容量
+    // 恢复后取得资格。只有真实同步占用工作，不用测试替代生产准入/状态。
+    #[test]
+    fn test_local_open_acquisition_capacity_failure_does_not_publish_and_can_retry() {
+        if isolated("test_local_open_acquisition_capacity_failure_does_not_publish_and_can_retry") { return; }
+        crate::set_local_blocking_capacity(NonZeroUsize::new(1).unwrap()).unwrap();
+        let temporary = fixture();
+        let path = temporary.path().join("data.bin");
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(&path, b"capacity-original").unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let (file, coordination) = block_on(opened(&path));
+        let retained = Arc::clone(&coordination);
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let occupied = async_global_executor::spawn(bounded_blocking::unblock(move || {
+            started_sender.send(()).unwrap();
+            release_receiver.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+        }));
+        started_receiver.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+        assert_eq!(block_on(acquire_opened_local_file(path.clone(), file, coordination, OpenAdmissionKind::Shared))
+            .unwrap_err().current_context(), &pi_result::ErrorKind::ResourceExhausted);
+        assert_eq!(std::fs::read_dir(&root_path).unwrap().count(), 0);
+        release_sender.send(()).unwrap();
+        block_on(occupied).unwrap();
+        let file = block_on(async_fs::File::open(&path)).unwrap();
+        let admitted = block_on(acquire_opened_local_file(path.clone(), file, retained, OpenAdmissionKind::Shared))
+            .expect("same object retries after capacity returns");
+        let root = Arc::new(CoordinationRootAnchor::open(root_path).unwrap());
+        assert_eq!(OwnedOpenAdmission::try_acquire(
+            Arc::clone(&root), std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive,
+        ).unwrap_err().current_context(), &pi_result::ErrorKind::Conflict);
+        drop(admitted);
+        drop(OwnedOpenAdmission::try_acquire(
+            root, std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive,
+        ).expect("no failed candidate keeps qualification"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"capacity-original");
+        println!("EXCLUSIVE_CHILD_VERIFIED capacity-retry");
+    }
+
+    // ACQ-T05：取消排队中的真实候选准备，必须由实际完成链继续持有文件和
+    // 原活动核心。分别覆盖尚无资格和已有SH；后者用独立原生EX确认不能早释。
+    #[test]
+    fn test_local_open_acquisition_cancelled_preparation_retains_the_actual_candidate() {
+        if isolated("test_local_open_acquisition_cancelled_preparation_retains_the_actual_candidate") { return; }
+        let temporary = fixture();
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let root = Arc::new(CoordinationRootAnchor::open(root_path).unwrap());
+        let mut observations = Vec::new();
+        for published in [false, true] {
+            let path = temporary.path().join(if published { "published.bin" } else { "unpublished.bin" });
+            std::fs::write(&path, b"cancel-original").unwrap();
+            let initial = if published {
+                let (file, coordination) = block_on(opened(&path));
+                Some(block_on(acquire_opened_local_file(path.clone(), file, coordination, OpenAdmissionKind::Shared)).unwrap())
+            } else { None };
+            let (file, coordination) = block_on(opened(&path));
+            let weak = Arc::downgrade(&coordination);
+            drop(initial);
+            let (started_sender, started_receiver) = std::sync::mpsc::channel();
+            let (release_sender, release_receiver) = std::sync::mpsc::channel();
+            let occupied = async_global_executor::spawn(blocking::unblock(move || {
+                started_sender.send(()).unwrap();
+                release_receiver.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+            }));
+            started_receiver.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+            let mut acquisition = Box::pin(acquire_opened_local_file(path.clone(), file, coordination, OpenAdmissionKind::Shared));
+            assert!(block_on(futures_lite::future::poll_once(acquisition.as_mut())).is_none());
+            drop(acquisition);
+            let retained_before_completion = weak.upgrade().is_some();
+            let native_probe = OwnedOpenAdmission::try_acquire(
+                Arc::clone(&root), std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive,
+            );
+            let qualification_retained = match native_probe {
+                Ok(admission) => { drop(admission); false }
+                Err(error) => {
+                    assert_eq!(error.current_context(), &pi_result::ErrorKind::Conflict);
+                    true
+                }
+            };
+            // 先排空真实任务再断言中间观测，失败也不留下阻塞worker或脏夹具。
+            release_sender.send(()).unwrap();
+            block_on(occupied);
+            block_on(blocking::unblock(|| ()));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while weak.upgrade().is_some() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(weak.upgrade().is_none(), "actual completion must eventually release the candidate core");
+            drop(OwnedOpenAdmission::try_acquire(
+                Arc::clone(&root), std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive,
+            ).expect("actual completion releases the last qualification"));
+            assert_eq!(std::fs::read(&path).unwrap(), b"cancel-original");
+            observations.push((published, retained_before_completion, qualification_retained));
+        }
+        println!("CANCELLATION_OBSERVATIONS {observations:?}");
+        for (published, retained, qualification_retained) in observations {
+            assert!(retained, "cancelled preparation must retain its actual candidate core; published={published}");
+            if published { assert!(qualification_retained, "existing qualification must outlive the actual preparation"); }
+        }
+        println!("EXCLUSIVE_CHILD_VERIFIED cancelled-owned-preparation");
+    }
+
+    // CMP-T01：生产冷取得必须真实申请EX；普通SH先到时拒绝，EX存活时
+    // 六角色/硬链接的独立申请均拒绝，末尾释放后恢复普通访问且原内容不变。
+    #[test]
+    fn test_local_exclusive_composition_exclusive_acquisition_preserves_data_and_excludes_ordinary_roles() {
+        if isolated("test_local_exclusive_composition_exclusive_acquisition_preserves_data_and_excludes_ordinary_roles") { return; }
+        let temporary = fixture();
+        let path = temporary.path().join("data.bin");
+        let alias = temporary.path().join("alias.bin");
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(&path, b"owner-original").unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path)).unwrap();
+        let namespace = LocalFileNamespace::new();
+        let ordinary = block_on(namespace.open(&path, FileAccessMode::Read)).unwrap();
+        assert_eq!(block_on(open_local_file(namespace.core, alias.clone(), FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive))
+            .err().expect("existing shared resource excludes EX").current_context(), &pi_result::ErrorKind::Conflict);
+        drop(ordinary);
+        let owner = block_on(open_local_file(namespace.core, path.clone(), FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive))
+            .expect("cold EX acquisition");
+        assert_eq!(block_on(owner.byte_len()).unwrap(), 14);
+        for locator in [&path, &alias] {
+            for access in [FileAccessMode::Read, FileAccessMode::Append, FileAccessMode::Overwrite,
+                FileAccessMode::Truncate, FileAccessMode::ReadMmap, FileAccessMode::ReadWriteMmap] {
+                assert_eq!(block_on(namespace.open(locator, access)).err().expect("EX excludes every independent ordinary role")
+                    .current_context(), &pi_result::ErrorKind::Conflict);
+            }
+        }
+        assert_eq!(block_on(open_local_file(namespace.core, alias, FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive))
+            .err().expect("EX is not implicitly reentrant").current_context(), &pi_result::ErrorKind::Conflict);
+        assert_eq!(std::fs::read(&path).unwrap(), b"owner-original");
+        drop(owner);
+        drop(block_on(namespace.open(&path, FileAccessMode::Read)).expect("last EX release admits ordinary resources"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"owner-original");
+        println!("EXCLUSIVE_CHILD_VERIFIED cold-exclusive-acquisition");
+    }
+
+    // CMP-T02：显式派生保留原六角色；映射/追加/刷新合法共存，普通读/
+    // 覆盖/截断/同文件映射来源仍冲突。最后映射克隆跨越owner/文件Drop保活EX。
+    #[test]
+    fn test_local_exclusive_composition_derived_roles_preserve_mapping_matrix_and_last_owner_lifetime() {
+        if isolated("test_local_exclusive_composition_derived_roles_preserve_mapping_matrix_and_last_owner_lifetime") { return; }
+        let temporary = fixture();
+        let path = temporary.path().join("data.bin");
+        let alias = temporary.path().join("alias.bin");
+        let other = temporary.path().join("other.bin");
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(&path, b"0123456789abcdef").unwrap();
+        std::fs::write(&other, b"other").unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path)).unwrap();
+        let namespace = LocalFileNamespace::new();
+        let owner = Arc::new(block_on(open_local_file(namespace.core, path.clone(), FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive)).unwrap());
+        assert_eq!(block_on(open_local_file_from_exclusive_resource(namespace.core, Arc::clone(&owner), other.clone(), FileAccessMode::Read))
+            .err().expect("wrong object cannot inherit EX").current_context(), &pi_result::ErrorKind::Conflict);
+        let derive = |access| block_on(open_local_file_from_exclusive_resource(namespace.core, Arc::clone(&owner), alias.clone(), access)).unwrap();
+        let reader = derive(FileAccessMode::Read);
+        let mut append = derive(FileAccessMode::Append);
+        let mut append_second = derive(FileAccessMode::Append);
+        let mut overwrite = derive(FileAccessMode::Overwrite);
+        let mut truncate = derive(FileAccessMode::Truncate);
+        let read_mapping = derive(FileAccessMode::ReadMmap);
+        let mut write_mapping = derive(FileAccessMode::ReadWriteMmap);
+        let mut bytes = [0_u8; 16];
+        block_on(reader.read_exact_at(0, &mut bytes, ReadTargetRegion::full())).unwrap();
+        assert_eq!(&bytes, b"0123456789abcdef");
+        // SAFETY: 真实独占夹具的所有访问均经本库；两个映射不相交且无人截断。
+        let mapping = unsafe { block_on(read_mapping.map_read_only_uncoordinated(crate::MmapRange::new(0, 4).unwrap())) }.unwrap();
+        // SAFETY: 与前一映射不相交，后续仅允许本库严格尾部追加和刷新。
+        let mut writable = unsafe { block_on(write_mapping.map_read_write_uncoordinated(crate::MmapRange::new(4, 8).unwrap())) }.unwrap();
+        writable.as_bytes_mut().copy_from_slice(b"WXYZ");
+        block_on(writable.flush()).unwrap();
+        block_on(append.append(Vec::from(&b"+"[..]))).unwrap();
+        block_on(append_second.append(bytes::Bytes::from_static(b"+"))).unwrap();
+        block_on(append.flush(crate::FileFlushMode::Data)).unwrap();
+        block_on(write_mapping.flush(crate::FileFlushMode::DataAndMetadata)).unwrap();
+        assert_eq!(mapping.as_bytes(), b"0123");
+        assert_eq!(writable.as_bytes(), b"WXYZ");
+        assert_eq!(block_on(reader.read_exact_at(0, &mut bytes, ReadTargetRegion::full())).unwrap_err().current_context(), &pi_result::ErrorKind::Conflict);
+        assert_eq!(block_on(overwrite.overwrite_all(Vec::from(&b"blocked"[..]))).unwrap_err().error().current_context(), &pi_result::ErrorKind::Conflict);
+        assert_eq!(block_on(truncate.truncate(0)).unwrap_err().current_context(), &pi_result::ErrorKind::Conflict);
+        let failure = block_on(append.append(mapping.clone())).expect_err("same-file mapping remains an invalid append source");
+        assert_eq!(failure.error().current_context(), &pi_result::ErrorKind::Conflict);
+        drop(failure);
+        assert_eq!(block_on(namespace.remove_file(&path)).unwrap_err().error().current_context(), &pi_result::ErrorKind::Conflict);
+        let last_mapping = mapping.clone();
+        drop(mapping);
+        drop(writable);
+        drop(owner);
+        drop(reader);
+        drop(append);
+        drop(append_second);
+        drop(overwrite);
+        drop(truncate);
+        drop(read_mapping);
+        drop(write_mapping);
+        assert_eq!(block_on(namespace.open(&path, FileAccessMode::Read)).err().expect("last mapping still owns EX").current_context(), &pi_result::ErrorKind::Conflict);
+        assert_eq!(last_mapping.as_bytes(), b"0123");
+        drop(last_mapping);
+        drop(block_on(namespace.open(&path, FileAccessMode::Read)).expect("last real derived owner releases EX"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"0123WXYZ89abcdef++");
+        assert_eq!(std::fs::read(&other).unwrap(), b"other");
+        println!("EXCLUSIVE_CHILD_VERIFIED explicit-derived-matrix");
+    }
+
+    // CMP-T03：旧凭据独活不留SH，EX明确加入旧协议且派生安全映射/追加；
+    // owner先释放不撤销最后映射的活动保护，旧凭据也不能删除同名新对象。
+    #[test]
+    fn test_local_exclusive_composition_authorized_owner_preserves_binding_and_last_mapping() {
+        if isolated("test_local_exclusive_composition_authorized_owner_preserves_binding_and_last_mapping") { return; }
+        let temporary = fixture();
+        let path = temporary.path().join("managed.bin");
+        let alias = temporary.path().join("alias.bin");
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(&path, b"managed-original").unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path)).unwrap();
+        let namespace = LocalFileNamespace::new();
+        // SAFETY: 独立真实夹具仅由本测试使用本库同一协调域访问。
+        let authority = unsafe { block_on(namespace.establish_cross_process_authority(&path)) }.unwrap();
+        let ordinary = block_on(namespace.open_with_cross_process_authority(&authority, FileAccessMode::Read)).unwrap();
+        assert_eq!(block_on(open_local_file_with_cross_process_authority(namespace.core, Arc::clone(authority.local_core()), FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive))
+            .err().expect("authorized SH excludes new EX").current_context(), &pi_result::ErrorKind::Conflict);
+        drop(ordinary);
+        let owner = Arc::new(block_on(open_local_file_with_cross_process_authority(namespace.core, Arc::clone(authority.local_core()), FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive)).unwrap());
+        assert_eq!(block_on(namespace.open_with_cross_process_authority(&authority, FileAccessMode::Append))
+            .err().expect("credential alone does not bypass EX").current_context(), &pi_result::ErrorKind::Conflict);
+        assert!(block_on(open_local_file_from_exclusive_resource(namespace.core, Arc::clone(&owner), alias, FileAccessMode::Read)).is_err(), "object qualification must not waive the old name binding");
+        let mapper = block_on(open_local_file_from_exclusive_resource(namespace.core, Arc::clone(&owner), path.clone(), FileAccessMode::ReadMmap)).unwrap();
+        let mut append = block_on(open_local_file_from_exclusive_resource(namespace.core, Arc::clone(&owner), path.clone(), FileAccessMode::Append)).unwrap();
+        let mapping = block_on(mapper.map_read_only(crate::MmapRange::new(0, 7).unwrap())).unwrap();
+        block_on(append.append(Vec::from(&b"+"[..]))).unwrap();
+        block_on(append.flush(crate::FileFlushMode::DataAndMetadata)).unwrap();
+        assert_eq!(mapping.as_bytes(), b"managed");
+        assert_eq!(block_on(namespace.remove_file_with_cross_process_authority(&authority)).unwrap_err().error().current_context(), &pi_result::ErrorKind::Conflict);
+        drop(owner);
+        drop(append);
+        drop(mapper);
+        assert_eq!(block_on(namespace.remove_file_with_cross_process_authority(&authority)).unwrap_err().error().current_context(), &pi_result::ErrorKind::Conflict);
+        assert_eq!(std::fs::read(&path).unwrap(), b"managed-original+");
+        drop(mapping);
+        block_on(namespace.remove_file_with_cross_process_authority(&authority)).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        assert!(block_on(open_local_file_with_cross_process_authority(namespace.core, Arc::clone(authority.local_core()), FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive)).is_err());
+        assert!(block_on(namespace.remove_file_with_cross_process_authority(&authority)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        println!("EXCLUSIVE_CHILD_VERIFIED authorized-exclusive-lifetime");
+    }
+
+    // CMP-T04：显式EX来源复制只继承同对象资格；普通位置复制仍拒绝，
+    // 受管/普通源均复用原长度、暂存、严格不替换及双失败证据，不复制目标状态。
+    #[test]
+    fn test_local_exclusive_composition_copy_owner_validates_source_and_preserves_failure_evidence() {
+        if isolated("test_local_exclusive_composition_copy_owner_validates_source_and_preserves_failure_evidence") { return; }
+        let temporary = fixture();
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path)).unwrap();
+        let namespace = LocalFileNamespace::new();
+        let contents = (0..READ_TRANSFER_CHUNK_BYTES + 1).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        for managed in [false, true] {
+            let source = temporary.path().join(format!("source-{managed}.bin"));
+            let wrong = temporary.path().join(format!("wrong-{managed}.bin"));
+            let destination = temporary.path().join(format!("target-{managed}.bin"));
+            let rejected = temporary.path().join(format!("rejected-{managed}.bin"));
+            std::fs::write(&source, &contents).unwrap();
+            std::fs::write(&wrong, b"wrong").unwrap();
+            let owner = if managed {
+                // SAFETY: 独立真实夹具只由同版本协议访问，没有旁路内容操作。
+                let authority = unsafe { block_on(namespace.establish_cross_process_authority(&source)) }.unwrap();
+                Arc::new(block_on(open_local_file_with_cross_process_authority(namespace.core, Arc::clone(authority.local_core()), FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive)).unwrap())
+            } else {
+                Arc::new(block_on(open_local_file(namespace.core, source.clone(), FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive)).unwrap())
+            };
+            let plain = block_on(namespace.copy_new(&source, &destination)).expect_err("location alone cannot inherit EX");
+            assert_eq!(plain.error().current_context(), &pi_result::ErrorKind::Conflict);
+            assert_eq!(plain.target_evidence(), &CopyTargetEvidence::NotPublishedByOperation);
+            assert_eq!(plain.staging_evidence(), &CopyStagingEvidence::NotCreatedByOperation);
+            let mismatch = block_on(copy_local_file(namespace.core, wrong.clone(), rejected.clone(), Arc::new(AtomicBool::new(false)), Some(Arc::clone(&owner))))
+                .expect_err("copy owner must match its actual source");
+            assert!(matches!(mismatch.error().current_context(), pi_result::ErrorKind::Conflict | pi_result::ErrorKind::NotFound));
+            assert_eq!(mismatch.target_evidence(), &CopyTargetEvidence::NotPublishedByOperation);
+            assert_eq!(mismatch.staging_evidence(), &CopyStagingEvidence::NotCreatedByOperation);
+            assert!(!rejected.exists());
+            let outcome = block_on(copy_local_file(namespace.core, source.clone(), destination.clone(), Arc::new(AtomicBool::new(false)), Some(Arc::clone(&owner))))
+                .expect("explicit owner source copy succeeds");
+            assert_eq!(outcome.content_byte_len(), contents.len() as u64);
+            assert_eq!(std::fs::read(&source).unwrap(), contents);
+            assert_eq!(std::fs::read(&destination).unwrap(), contents);
+            let duplicate = block_on(copy_local_file(namespace.core, source.clone(), destination.clone(), Arc::new(AtomicBool::new(false)), Some(Arc::clone(&owner))))
+                .expect_err("owner grants no target replacement");
+            assert_eq!(duplicate.error().current_context(), &pi_result::ErrorKind::AlreadyExists);
+            assert_eq!(duplicate.target_evidence(), &CopyTargetEvidence::NotPublishedByOperation);
+            assert_eq!(duplicate.staging_evidence(), &CopyStagingEvidence::NotCreatedByOperation);
+            let mapper = block_on(open_local_file_from_exclusive_resource(namespace.core, Arc::clone(&owner), source.clone(), FileAccessMode::ReadMmap)).unwrap();
+            let mapping = if managed {
+                block_on(mapper.map_read_only(crate::MmapRange::new(0, 1).unwrap())).unwrap()
+            } else {
+                // SAFETY: 夹具的稳定性由当前测试保证，仅合法独立通道访问。
+                unsafe { block_on(mapper.map_read_only_uncoordinated(crate::MmapRange::new(0, 1).unwrap())) }.unwrap()
+            };
+            let conflict = block_on(copy_local_file(namespace.core, source, rejected.clone(), Arc::new(AtomicBool::new(false)), Some(Arc::clone(&owner))))
+                .expect_err("explicit owner does not waive mapping/read exclusion");
+            assert_eq!(conflict.error().current_context(), &pi_result::ErrorKind::Conflict);
+            assert_eq!(conflict.staging_evidence(), &CopyStagingEvidence::NotCreatedByOperation);
+            assert!(!rejected.exists());
+            assert_eq!(mapping.as_bytes(), &[0]);
+            drop(mapping);
+            drop(mapper);
+            drop(owner);
+            assert_eq!(std::fs::read(&wrong).unwrap(), b"wrong");
+            assert_eq!(std::fs::read(&destination).unwrap(), contents);
+        }
+        println!("EXCLUSIVE_CHILD_VERIFIED explicit-owner-copy");
+    }
+
+    // CMP-T01：默认根不偷换成按路径独占；失败无内容改变或新协调资产。
+    #[test]
+    fn test_local_exclusive_composition_default_root_is_unsupported_without_assets() {
+        if isolated("test_local_exclusive_composition_default_root_is_unsupported_without_assets") { return; }
+        let temporary = fixture();
+        let path = temporary.path().join("data.bin");
+        std::fs::write(&path, b"default-owner").unwrap();
+        let namespace = LocalFileNamespace::new();
+        assert_eq!(block_on(open_local_file(namespace.core, path.clone(), FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive))
+            .err().expect("no common root must reject EX").current_context(), &pi_result::ErrorKind::Unsupported);
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), b"default-owner");
+        drop(block_on(namespace.open(&path, FileAccessMode::Read)).unwrap());
+        println!("EXCLUSIVE_CHILD_VERIFIED default-exclusive-unsupported");
+    }
+
+    // CMP-T01：独占必须先取得真实RW权限；只有R权限的合法普通源仍能读取，
+    // EX失败不遗留资格、不隐式放宽owner能力；权限夹具明确要求非root。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_local_exclusive_composition_exclusive_requires_read_write_permission() {
+        if isolated("test_local_exclusive_composition_exclusive_requires_read_write_permission") { return; }
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: 只查询当前有效用户标识，不涉及内存或资源所有权。
+        assert_ne!(unsafe { libc::geteuid() }, 0, "permission observation requires a non-root user");
+        let temporary = fixture();
+        let path = temporary.path().join("read-only.bin");
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(&path, b"readable").unwrap();
+        let original_permissions = std::fs::metadata(&path).unwrap().permissions();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path)).unwrap();
+        let namespace = LocalFileNamespace::new();
+        let result = block_on(open_local_file(namespace.core, path.clone(), FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive));
+        std::fs::set_permissions(&path, original_permissions).unwrap();
+        assert_eq!(result.err().expect("owner must actually request RW permission").current_context(), &pi_result::ErrorKind::PermissionDenied);
+        let owner = block_on(open_local_file(namespace.core, path.clone(), FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive)).unwrap();
+        assert_eq!(block_on(owner.byte_len()).unwrap(), 8);
+        drop(owner);
+        assert_eq!(std::fs::read(&path).unwrap(), b"readable");
+        println!("EXCLUSIVE_CHILD_VERIFIED owner-rw-permission");
+    }
+
+    // CMP-T05：真实worker暂停冷派生；取消等待并释放最后外部owner后，生产
+    // 完成者仍须握住EX及原协议生命周期。测试只驱动生产Future，不代装任务。
+    #[test]
+    fn test_local_exclusive_composition_cancelled_derivation_retains_owner_until_real_completion() {
+        if isolated("test_local_exclusive_composition_cancelled_derivation_retains_owner_until_real_completion") { return; }
+        let temporary = fixture();
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let namespace = LocalFileNamespace::new();
+        let root = Arc::new(CoordinationRootAnchor::open(root_path).unwrap());
+        for managed in [false, true] {
+            let path = temporary.path().join(format!("cancel-derived-{managed}.bin"));
+            std::fs::write(&path, b"cancel-owner").unwrap();
+            let authority = if managed {
+                // SAFETY: 独立真实夹具仅通过同版本本库协议访问。
+                Some(unsafe { block_on(namespace.establish_cross_process_authority(&path)) }.unwrap())
+            } else { None };
+            let owner = Arc::new(match authority.as_ref() {
+                Some(authority) => block_on(open_local_file_with_cross_process_authority(namespace.core, Arc::clone(authority.local_core()), FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive)).unwrap(),
+                None => block_on(open_local_file(namespace.core, path.clone(), FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive)).unwrap(),
+            });
+            let weak = Arc::downgrade(&owner);
+            let (started_sender, started_receiver) = std::sync::mpsc::channel();
+            let (release_sender, release_receiver) = std::sync::mpsc::channel();
+            let occupied = async_global_executor::spawn(blocking::unblock(move || {
+                started_sender.send(()).unwrap();
+                release_receiver.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+            }));
+            started_receiver.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+            let mut derivation = Box::pin(open_local_file_from_exclusive_resource(namespace.core, Arc::clone(&owner), path.clone(), FileAccessMode::Append));
+            assert!(block_on(futures_lite::future::poll_once(derivation.as_mut())).is_none());
+            drop(owner);
+            drop(derivation);
+            let retained = weak.upgrade().is_some();
+            let qualification_held = match OwnedOpenAdmission::try_acquire(Arc::clone(&root), std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Shared) {
+                Ok(qualification) => { drop(qualification); false }
+                Err(error) => { assert_eq!(error.current_context(), &pi_result::ErrorKind::Conflict); true }
+            };
+            let lifecycle_held = authority.as_ref().map(|authority| {
+                match try_lock_sidecar_exclusive(&authority.local_core().binding.layout.lifecycle_gate) {
+                    Ok(lock) => { drop(lock); false }
+                    Err(error) => { assert_eq!(error.current_context(), &pi_result::ErrorKind::Conflict); true }
+                }
+            });
+            // 先排空真实生产工作，再报告中间失败；任何红线都不留下占用worker。
+            release_sender.send(()).unwrap();
+            block_on(occupied);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while weak.upgrade().is_some() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(weak.upgrade().is_none(), "actual derivation completion releases its temporary owner");
+            // 原owner值销毁不等于未交付新资源的字段析构已经全部结束；最终
+            // 仍用真实原生仲裁成功证明释放，不用Weak/调度间隙冒充内核完成。
+            loop {
+                match OwnedOpenAdmission::try_acquire(Arc::clone(&root), std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Shared) {
+                    Ok(qualification) => { drop(qualification); break; }
+                    Err(error) => {
+                        assert_eq!(error.current_context(), &pi_result::ErrorKind::Conflict);
+                        assert!(std::time::Instant::now() < deadline, "actual derivation must release EX after completion");
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+            if let Some(authority) = authority.as_ref() {
+                loop {
+                    match try_lock_sidecar_exclusive(&authority.local_core().binding.layout.lifecycle_gate) {
+                        Ok(lock) => { drop(lock); break; }
+                        Err(error) => {
+                            assert_eq!(error.current_context(), &pi_result::ErrorKind::Conflict);
+                            assert!(std::time::Instant::now() < deadline, "actual derivation must release original lifecycle protection");
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                    }
+                }
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), b"cancel-owner");
+            println!("DERIVATION_CANCEL_OBSERVATION managed={managed} owner_retained={retained} qualification_held={qualification_held} lifecycle_held={lifecycle_held:?}");
+            assert!(retained && qualification_held && lifecycle_held != Some(false), "cancelled cold derivation must retain its actual owner until completion");
+        }
+        println!("EXCLUSIVE_CHILD_VERIFIED cancelled-derived-owner");
+    }
+
+    // CMP-T04/T05：复制共同生产入口接管owner和取消标志，取消停等且最后
+    // 外部owner释放后，EX/旧生命周期保护仍须持续到实际未发布清理结束。
+    #[test]
+    fn test_local_exclusive_composition_cancelled_copy_retains_owner_and_never_publishes() {
+        if isolated("test_local_exclusive_composition_cancelled_copy_retains_owner_and_never_publishes") { return; }
+        let temporary = fixture();
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let namespace = LocalFileNamespace::new();
+        let root = Arc::new(CoordinationRootAnchor::open(root_path).unwrap());
+        for managed in [false, true] {
+            let path = temporary.path().join(format!("cancel-copy-{managed}.bin"));
+            let destination = temporary.path().join(format!("cancel-target-{managed}.bin"));
+            std::fs::write(&path, b"copy-owner").unwrap();
+            let authority = if managed {
+                // SAFETY: 所有参与者都是当前测试的同版本本库，没有外部内容修改。
+                Some(unsafe { block_on(namespace.establish_cross_process_authority(&path)) }.unwrap())
+            } else { None };
+            let owner = Arc::new(match authority.as_ref() {
+                Some(authority) => block_on(open_local_file_with_cross_process_authority(namespace.core, Arc::clone(authority.local_core()), FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive)).unwrap(),
+                None => block_on(open_local_file(namespace.core, path.clone(), FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive)).unwrap(),
+            });
+            let weak = Arc::downgrade(&owner);
+            let (started_sender, started_receiver) = std::sync::mpsc::channel();
+            let (release_sender, release_receiver) = std::sync::mpsc::channel();
+            let occupied = async_global_executor::spawn(blocking::unblock(move || {
+                started_sender.send(()).unwrap();
+                release_receiver.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+            }));
+            started_receiver.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+            let mut copying = Box::pin(copy_local_file_owned(namespace.core, path.clone(), destination.clone(), Some(Arc::clone(&owner))));
+            assert!(block_on(futures_lite::future::poll_once(copying.as_mut())).is_none());
+            drop(owner);
+            drop(copying);
+            let retained = weak.upgrade().is_some();
+            let qualification_held = match OwnedOpenAdmission::try_acquire(Arc::clone(&root), std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Shared) {
+                Ok(qualification) => { drop(qualification); false }
+                Err(error) => { assert_eq!(error.current_context(), &pi_result::ErrorKind::Conflict); true }
+            };
+            let lifecycle_held = authority.as_ref().map(|authority| {
+                match try_lock_sidecar_exclusive(&authority.local_core().binding.layout.lifecycle_gate) {
+                    Ok(lock) => { drop(lock); false }
+                    Err(error) => { assert_eq!(error.current_context(), &pi_result::ErrorKind::Conflict); true }
+                }
+            });
+            release_sender.send(()).unwrap();
+            block_on(occupied);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match OwnedOpenAdmission::try_acquire(Arc::clone(&root), std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Shared) {
+                    Ok(qualification) => { drop(qualification); break; }
+                    Err(error) => {
+                        assert_eq!(error.current_context(), &pi_result::ErrorKind::Conflict);
+                        assert!(std::time::Instant::now() < deadline, "real cancelled copy must finish and release EX");
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+            if let Some(authority) = authority.as_ref() {
+                loop {
+                    match try_lock_sidecar_exclusive(&authority.local_core().binding.layout.lifecycle_gate) {
+                        Ok(lock) => { drop(lock); break; }
+                        Err(error) => {
+                            assert_eq!(error.current_context(), &pi_result::ErrorKind::Conflict);
+                            assert!(std::time::Instant::now() < deadline, "real cancelled copy must release original lifecycle protection");
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                    }
+                }
+            }
+            assert!(weak.upgrade().is_none());
+            assert!(!destination.exists());
+            assert!(std::fs::read_dir(temporary.path()).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".copy")));
+            assert_eq!(std::fs::read(&path).unwrap(), b"copy-owner");
+            println!("COPY_CANCEL_OBSERVATION managed={managed} owner_retained={retained} qualification_held={qualification_held} lifecycle_held={lifecycle_held:?}");
+            assert!(retained && qualification_held && lifecycle_held != Some(false));
+        }
+        println!("EXCLUSIVE_CHILD_VERIFIED cancelled-owner-copy");
+    }
+
+    // CMP-T01：新增EX冷编排对不存在/目录的拒绝保持原分类；不创建目标，
+    // 失败不建立资格载体，之后同配置的真实普通文件仍可正常取得EX。
+    #[test]
+    fn test_local_exclusive_composition_missing_and_directory_fail_without_admission_assets() {
+        if isolated("test_local_exclusive_composition_missing_and_directory_fail_without_admission_assets") { return; }
+        let temporary = fixture();
+        let root_path = temporary.path().join("coordination");
+        let missing = temporary.path().join("missing.bin");
+        let directory = temporary.path().join("directory");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let namespace = LocalFileNamespace::new();
+        for (path, expected) in [(missing.clone(), pi_result::ErrorKind::NotFound), (directory, pi_result::ErrorKind::Unsupported)] {
+            assert_eq!(block_on(open_local_file(namespace.core, path, FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive))
+                .err().expect("unsupported or missing object cannot grant EX").current_context(), &expected);
+        }
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(&root_path).unwrap().count(), 0);
+        std::fs::write(&missing, b"created-later").unwrap();
+        drop(block_on(open_local_file(namespace.core, missing.clone(), FileAccessMode::ReadWriteMmap, OpenAdmissionKind::Exclusive)).unwrap());
+        assert_eq!(std::fs::read(&missing).unwrap(), b"created-later");
+        println!("EXCLUSIVE_CHILD_VERIFIED exclusive-invalid-targets");
+    }
+
+    // PSA-T01：通过原公开open取得SH，独立原生EX必须冲突；所有公开角色
+    // 都不得越过已持有EX。真实硬链接与精确文件内容同时核验，不代理公开准入。
+    #[test]
+    fn test_local_public_acquisition_ordinary_open_participates_in_shared_qualification() {
+        if isolated("test_local_public_acquisition_ordinary_open_participates_in_shared_qualification") { return; }
+        let temporary = fixture();
+        let path = temporary.path().join("data.bin");
+        let alias = temporary.path().join("alias.bin");
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(&path, b"public-original").unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let namespace = LocalFileNamespace::new();
+        let root = Arc::new(CoordinationRootAnchor::open(root_path).unwrap());
+        let first = block_on(namespace.open(&path, FileAccessMode::Read)).unwrap();
+        let second = block_on(namespace.clone().open(&alias, FileAccessMode::Append)).unwrap();
+        let probe = OwnedOpenAdmission::try_acquire(Arc::clone(&root), std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive);
+        let was_excluded = probe.as_ref().err().is_some_and(|error| error.current_context() == &pi_result::ErrorKind::Conflict);
+        drop(probe);
+        assert!(was_excluded, "public ordinary resources must exclude native exclusive admission");
+        drop(first);
+        assert_eq!(OwnedOpenAdmission::try_acquire(Arc::clone(&root), std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive)
+            .unwrap_err().current_context(), &pi_result::ErrorKind::Conflict);
+        drop(second);
+        let exclusive = OwnedOpenAdmission::try_acquire(root, std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive).unwrap();
+        for locator in [&path, &alias] {
+            for access in [FileAccessMode::Read, FileAccessMode::Append, FileAccessMode::Overwrite,
+                FileAccessMode::Truncate, FileAccessMode::ReadMmap, FileAccessMode::ReadWriteMmap] {
+                let error = block_on(namespace.open(locator, access)).err().expect("every ordinary role must respect existing EX");
+                assert_eq!(error.current_context(), &pi_result::ErrorKind::Conflict);
+            }
+        }
+        drop(exclusive);
+        let reader = block_on(namespace.open(&path, FileAccessMode::Read)).unwrap();
+        let mut contents = [0_u8; 15];
+        block_on(reader.read_exact_at(0, &mut contents, ReadTargetRegion::full())).unwrap();
+        assert_eq!(&contents, b"public-original");
+        drop(reader);
+        assert_eq!(std::fs::read(&path).unwrap(), b"public-original");
+        println!("EXCLUSIVE_CHILD_VERIFIED public-shared-open");
+    }
+
+    // PSA-T02：六角色普通/协调创建及凭据重开都必须由公开入口持SH；
+    // 只剩凭据时独立EX可取得，失败/释放不可由测试侧手工补资格。
+    #[test]
+    fn test_local_public_acquisition_create_and_authority_open_hold_only_active_shared_qualification() {
+        if isolated("test_local_public_acquisition_create_and_authority_open_hold_only_active_shared_qualification") { return; }
+        let temporary = fixture();
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let namespace = LocalFileNamespace::new();
+        let root = Arc::new(CoordinationRootAnchor::open(root_path).unwrap());
+        let probe = |path: &Path| OwnedOpenAdmission::try_acquire(
+            Arc::clone(&root), std::fs::File::open(path).unwrap(), OpenAdmissionKind::Exclusive,
+        );
+        for (index, access) in [FileAccessMode::Read, FileAccessMode::Append, FileAccessMode::Overwrite,
+            FileAccessMode::Truncate, FileAccessMode::ReadMmap, FileAccessMode::ReadWriteMmap].into_iter().enumerate() {
+            let path = temporary.path().join(format!("ordinary-{index}.bin"));
+            let resource = block_on(namespace.create_new(&path, access)).unwrap();
+            assert_eq!(probe(&path).expect_err("public created resource must hold SH").current_context(), &pi_result::ErrorKind::Conflict);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+            drop(resource);
+            drop(probe(&path).expect("last ordinary creation resource releases SH"));
+        }
+        for (index, access) in [FileAccessMode::Read, FileAccessMode::Append, FileAccessMode::Overwrite,
+            FileAccessMode::Truncate, FileAccessMode::ReadMmap, FileAccessMode::ReadWriteMmap].into_iter().enumerate() {
+            let path = temporary.path().join(format!("coordinated-{index}.bin"));
+            // SAFETY: 真实夹具只由此测试经同一协议访问；探针只持身份/资格，不修改内容。
+            let created = unsafe { block_on(namespace.create_new_coordinated(path.clone(), access)) }.unwrap();
+            let (authority, resource) = created.into_parts();
+            assert_eq!(probe(&path).expect_err("coordinated creation resource must hold SH").current_context(), &pi_result::ErrorKind::Conflict);
+            drop(resource);
+            let exclusive = probe(&path).expect("idle credential must not retain SH");
+            assert_eq!(block_on(namespace.open_with_cross_process_authority(&authority, FileAccessMode::Read))
+                .err().expect("existing EX also rejects credential-based ordinary open").current_context(), &pi_result::ErrorKind::Conflict);
+            drop(exclusive);
+            let reader = block_on(namespace.open_with_cross_process_authority(&authority, FileAccessMode::Read)).unwrap();
+            assert_eq!(probe(&path).expect_err("credential-based resource must hold SH").current_context(), &pi_result::ErrorKind::Conflict);
+            assert_eq!(block_on(reader.byte_len()).unwrap(), 0);
+            drop(reader);
+            drop(probe(&path).expect("idle credential after reopen releases SH"));
+            drop(authority);
+        }
+        println!("EXCLUSIVE_CHILD_VERIFIED public-create-authority");
+    }
+
+    // PSA-T03：原公开位置复制不得读取已持EX的源；失败不创建暂存/目标。
+    // 释放后跨三个传输窗口成功，最后源/目标资格都可取得，精确核对全部字节。
+    #[test]
+    fn test_local_public_acquisition_copy_source_respects_exclusive_qualification() {
+        if isolated("test_local_public_acquisition_copy_source_respects_exclusive_qualification") { return; }
+        let temporary = fixture();
+        let source = temporary.path().join("source.bin");
+        let destination = temporary.path().join("destination.bin");
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        let contents = vec![0x4b; READ_TRANSFER_CHUNK_BYTES * 2 + 1];
+        std::fs::write(&source, &contents).unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let namespace = LocalFileNamespace::new();
+        let root = Arc::new(CoordinationRootAnchor::open(root_path).unwrap());
+        let exclusive = OwnedOpenAdmission::try_acquire(Arc::clone(&root), std::fs::File::open(&source).unwrap(), OpenAdmissionKind::Exclusive).unwrap();
+        let failure = block_on(namespace.copy_new(&source, &destination)).expect_err("copy must not bypass source exclusive admission");
+        assert_eq!(failure.error().current_context(), &pi_result::ErrorKind::Conflict);
+        assert_eq!(failure.target_evidence(), &CopyTargetEvidence::NotPublishedByOperation);
+        assert_eq!(failure.staging_evidence(), &CopyStagingEvidence::NotCreatedByOperation);
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 2);
+        assert_eq!(std::fs::read(&source).unwrap(), contents);
+        drop(exclusive);
+        assert_eq!(block_on(namespace.copy_new(&source, &destination)).unwrap().content_byte_len(), contents.len() as u64);
+        assert_eq!(std::fs::read(&destination).unwrap(), contents);
+        for path in [&source, &destination] {
+            drop(OwnedOpenAdmission::try_acquire(Arc::clone(&root), std::fs::File::open(path).unwrap(), OpenAdmissionKind::Exclusive)
+                .expect("completed copy releases all content resource qualifications"));
+        }
+        println!("EXCLUSIVE_CHILD_VERIFIED public-copy-source");
+    }
+
+    // PSA-T03：真实暂存生产出口持SH至原清理完成；对空暂存的独立EX
+    // 探针和身份安全删除证据共同验证，测试不手工建立/撤销暂存资格。
+    #[test]
+    fn test_local_public_acquisition_copy_staging_holds_shared_until_cleanup() {
+        if isolated("test_local_public_acquisition_copy_staging_holds_shared_until_cleanup") { return; }
+        let temporary = fixture();
+        let root_path = temporary.path().join("coordination");
+        let destination = temporary.path().join("destination.bin");
+        std::fs::create_dir(&root_path).unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let namespace = LocalFileNamespace::new();
+        let staging = block_on(create_local_copy_staging(namespace.core, &destination, &AtomicBool::new(false)))
+            .unwrap_or_else(|(error, evidence)| panic!("staging failed: {error}; {evidence:?}"));
+        let staging_path = staging.path.clone();
+        let root = Arc::new(CoordinationRootAnchor::open(root_path).unwrap());
+        assert_eq!(OwnedOpenAdmission::try_acquire(root, std::fs::File::open(&staging_path).unwrap(), OpenAdmissionKind::Exclusive)
+            .unwrap_err().current_context(), &pi_result::ErrorKind::Conflict);
+        assert_eq!(std::fs::metadata(&staging_path).unwrap().len(), 0);
+        assert!(!destination.exists());
+        assert_eq!(block_on(staging.cleanup()), CopyStagingEvidence::CreatedThenRemovedByOperation);
+        assert!(!staging_path.exists());
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
+        println!("EXCLUSIVE_CHILD_VERIFIED copy-staging-qualification");
+    }
+
+    // PSA-T04：从未poll的所有普通入口不固定根；非内容查询也不固定。
+    // 失败的首次open仍固定Default，拒绝后来切换域，且不留下文件/协调资产。
+    #[test]
+    fn test_local_public_acquisition_unpolled_calls_are_lazy_and_failed_open_freezes_default() {
+        if isolated("test_local_public_acquisition_unpolled_calls_are_lazy_and_failed_open_freezes_default") { return; }
+        let temporary = fixture();
+        let missing = temporary.path().join("missing.bin");
+        let other = temporary.path().join("other.bin");
+        let namespace = LocalFileNamespace::new();
+        drop(namespace.open(&missing, FileAccessMode::Read));
+        drop(namespace.create_new(&missing, FileAccessMode::Read));
+        drop(namespace.copy_new(&missing, &other));
+        // SAFETY: Future不poll；夹具独占，同一协议前提在全部生命周期成立。
+        drop(unsafe { namespace.create_new_coordinated(missing.clone(), FileAccessMode::Read) });
+        assert!(!block_on(namespace.try_exists(&missing)).unwrap());
+        assert!(block_on(namespace.metadata(&temporary.path().to_path_buf())).is_ok());
+        assert!(crate::coordination_root_config::configured_cross_process_coordination_root().is_none());
+        assert_eq!(block_on(namespace.open(&missing, FileAccessMode::Read)).err().unwrap().current_context(), &pi_result::ErrorKind::NotFound);
+        assert_eq!(crate::coordination_root_config::configured_cross_process_coordination_root(), Some(&crate::CrossProcessCoordinationRoot::FileParent));
+        assert_eq!(crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(temporary.path().join("late")))
+            .unwrap_err().current_context(), &pi_result::ErrorKind::Conflict);
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 0);
+        println!("EXCLUSIVE_CHILD_VERIFIED lazy-and-first-failure");
+    }
+
+    // PSA-T04：首次create失败也固定Default，目标未创建证据与实际磁盘一致。
+    #[test]
+    fn test_local_public_acquisition_failed_create_freezes_default_before_parent_resolution() {
+        if isolated("test_local_public_acquisition_failed_create_freezes_default_before_parent_resolution") { return; }
+        let temporary = fixture();
+        let missing = temporary.path().join("missing-parent").join("data.bin");
+        let namespace = LocalFileNamespace::new();
+        let failure = block_on(namespace.create_new(&missing, FileAccessMode::Read)).err().unwrap();
+        assert_eq!(failure.error().current_context(), &pi_result::ErrorKind::NotFound);
+        assert_eq!(failure.target_evidence(), &crate::CreateTargetEvidence::NotCreatedByOperation);
+        assert_eq!(crate::coordination_root_config::configured_cross_process_coordination_root(), Some(&crate::CrossProcessCoordinationRoot::FileParent));
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 0);
+        println!("EXCLUSIVE_CHILD_VERIFIED create-first-failure");
+    }
+
+    // PSA-T04：首次copy的目标前置失败固定Default，但两项副作用证据仍为未产生。
+    #[test]
+    fn test_local_public_acquisition_failed_copy_freezes_default_without_assets() {
+        if isolated("test_local_public_acquisition_failed_copy_freezes_default_without_assets") { return; }
+        let temporary = fixture();
+        let source = temporary.path().join("source.bin");
+        let destination = temporary.path().join("missing-parent").join("destination.bin");
+        let failure = block_on(LocalFileNamespace::new().copy_new(&source, &destination)).unwrap_err();
+        assert_eq!(failure.error().current_context(), &pi_result::ErrorKind::NotFound);
+        assert_eq!(failure.target_evidence(), &CopyTargetEvidence::NotPublishedByOperation);
+        assert_eq!(failure.staging_evidence(), &CopyStagingEvidence::NotCreatedByOperation);
+        assert_eq!(crate::coordination_root_config::configured_cross_process_coordination_root(), Some(&crate::CrossProcessCoordinationRoot::FileParent));
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 0);
+        println!("EXCLUSIVE_CHILD_VERIFIED copy-first-failure");
+    }
+
+    // PSA-T02/T04：Custom根缺失在真正创建后被候选核验拒绝；真实新空文件
+    // 必须保留且明确CreatedByOperation。修复外部根后可以正常打开，不自动重建根。
+    #[test]
+    fn test_local_public_acquisition_post_create_root_failure_preserves_created_evidence() {
+        if isolated("test_local_public_acquisition_post_create_root_failure_preserves_created_evidence") { return; }
+        let temporary = fixture();
+        let path = temporary.path().join("created.bin");
+        let root_path = temporary.path().join("missing-root");
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let namespace = LocalFileNamespace::new();
+        let failure = block_on(namespace.create_new(&path, FileAccessMode::Read)).err().expect("missing Custom root must not downgrade");
+        assert_eq!(failure.error().current_context(), &pi_result::ErrorKind::NotFound);
+        assert_eq!(failure.target_evidence(), &crate::CreateTargetEvidence::CreatedByOperation);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        assert!(!root_path.exists());
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
+        std::fs::create_dir(&root_path).unwrap();
+        let resource = block_on(namespace.open(&path, FileAccessMode::Read)).unwrap();
+        assert_eq!(block_on(resource.byte_len()).unwrap(), 0);
+        drop(resource);
+        let root = Arc::new(CoordinationRootAnchor::open(root_path).unwrap());
+        drop(OwnedOpenAdmission::try_acquire(root, std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive).unwrap());
+        println!("EXCLUSIVE_CHILD_VERIFIED post-create-evidence");
+    }
+
+    // PSA-T04/PSA-DIAG-01：逐个真实worker门推进普通open，停在候选已经
+    // 移交、资格准备尚未结束的窗口。取消等待不能提前撤同名预约；原注册表
+    // 的真实try_reserve只作独立冲突观测，不替代任何打开/资格/清理逻辑。
+    #[test]
+    fn test_local_public_acquisition_cancelled_open_retains_name_until_real_completion() {
+        if isolated("test_local_public_acquisition_cancelled_open_retains_name_until_real_completion") { return; }
+        let temporary = fixture();
+        let path = temporary.path().join("data.bin");
+        let renamed = temporary.path().join("renamed.bin");
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(&path, b"cancel-open-original").unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let namespace = LocalFileNamespace::new();
+        let (probe_file, coordination) = block_on(opened(&path));
+        drop(probe_file);
+        assert_eq!(Arc::strong_count(&coordination), 1);
+        let key = namespace_entry_key_sync(&path).unwrap().unwrap();
+        let mut future = Box::pin(namespace.open(&path, FileAccessMode::Read));
+        let mut held_gate = None;
+        for _ in 0..32 {
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+            let mut gate = Box::pin(blocking::unblock(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }));
+            assert!(block_on(futures_lite::future::poll_once(&mut gate)).is_none());
+            entered_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let pending = block_on(futures_lite::future::poll_once(&mut future)).is_none();
+            assert!(pending, "worker-gated open must not finish before its actual preparation");
+            std::thread::yield_now();
+            if Arc::strong_count(&coordination) > 1 {
+                held_gate = Some((release_tx, gate));
+                break;
+            }
+            release_tx.send(()).unwrap();
+            block_on(gate);
+        }
+        let (release, gate) = held_gate.expect("real open must reach its candidate handoff within bounded steps");
+        let before_cancel = namespace.core.namespace_entries.try_reserve(
+            namespace_entry_key_sync(&path).unwrap().unwrap(), namespace.core.allocate_resource_id().unwrap(),
+        );
+        let name_retained_before_cancel = before_cancel.as_ref().err().is_some_and(|error| error.current_context() == &pi_result::ErrorKind::Conflict);
+        drop(before_cancel);
+        drop(future);
+        let reservation = namespace.core.namespace_entries.try_reserve(key, namespace.core.allocate_resource_id().unwrap());
+        let name_retained = reservation.as_ref().err().is_some_and(|error| error.current_context() == &pi_result::ErrorKind::Conflict);
+        drop(reservation);
+        let candidate_retained = Arc::strong_count(&coordination) > 1;
+        release.send(()).unwrap();
+        block_on(gate);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while Arc::strong_count(&coordination) != 1 {
+            assert!(std::time::Instant::now() < deadline, "cancelled open must reach actual resource disposal");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(coordination);
+        let root = Arc::new(CoordinationRootAnchor::open(root_path).unwrap());
+        loop {
+            match OwnedOpenAdmission::try_acquire(Arc::clone(&root), std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive) {
+                Ok(exclusive) => { drop(exclusive); break; }
+                Err(error) if error.current_context() == &pi_result::ErrorKind::Conflict => {
+                    assert!(std::time::Instant::now() < deadline, "cancelled open must release native admission");
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("unexpected release probe: {error}"),
+            }
+        }
+        block_on(namespace.rename(&path, &renamed)).unwrap();
+        assert_eq!(std::fs::read(&renamed).unwrap(), b"cancel-open-original");
+        println!("CANCELLED_OPEN_OBSERVATIONS before_cancel={name_retained_before_cancel} name_retained={name_retained} candidate_retained={candidate_retained}");
+        assert!(name_retained_before_cancel, "the same real key must conflict before cancellation");
+        assert!(candidate_retained, "the real candidate is still owned while its worker is gated");
+        assert!(name_retained, "cancellation must retain the actual name reservation until preparation stops");
+        println!("EXCLUSIVE_CHILD_VERIFIED cancelled-open-reservation");
+    }
+
+    // PSA-LIF-01：Linux真实系统调用专项，不模拟IO。公开copy冻结两字节，
+    // 暂存真实创建后旁路缩短独占夹具源至一字节，驱动原意外EOF失败链。
+    // strace只延迟实际暂存write，不替换其返回；两个worker让清理可与写者
+    // 真实竞争。原FD身份核验避免编号复用，最后等待真实关闭再断言/清理。
+    // 此专项需要主机已有strace和对子进程的ptrace权限，不以提前return跳过。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_local_public_acquisition_copy_failure_closes_real_writer_before_shared_release() {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        use std::os::unix::fs::MetadataExt;
+        const CHILD: &str = "PI_ASYNC_FS_COPY_WRITER_TRACE_CHILD";
+        const NAME: &str = "test_local_public_acquisition_copy_failure_closes_real_writer_before_shared_release";
+        if std::env::var(CHILD).as_deref() != Ok(NAME) {
+            // 父方持有夹具；子方被强制终止时，也在两个进程回收后正常清理。
+            let temporary = fixture();
+            // 观测器只拥有测试子进程；任意断言失败也不能留下tracer或被暂停worker。
+            struct Processes { child: std::process::Child, tracer: Option<std::process::Child> }
+            impl Drop for Processes {
+                fn drop(&mut self) {
+                    let _ = self.child.kill();
+                    if let Some(tracer) = self.tracer.as_mut() {
+                        let _ = tracer.kill();
+                    }
+                    let _ = self.child.wait();
+                    if let Some(tracer) = self.tracer.as_mut() {
+                        let _ = tracer.wait();
+                    }
+                }
+            }
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg(format!("local::exclusive_open_tests::{NAME}"))
+                .arg("--exact").arg("--nocapture").arg("--test-threads=1")
+                .env(CHILD, NAME).env("BLOCKING_MAX_THREADS", "2")
+                .env("PI_ASYNC_FS_COPY_WRITER_TRACE_DIRECTORY", temporary.path())
+                .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()).spawn().unwrap();
+            let mut processes = Processes { child, tracer: None };
+            let stdout = processes.child.stdout.take().unwrap();
+            let stderr = processes.child.stderr.take().unwrap();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let mut output = String::new();
+                for line in std::io::BufReader::new(stdout).lines() {
+                    let line = line.unwrap();
+                    if let Some(path) = line.strip_prefix("PSA_TRACE_READY ") {
+                        ready_tx.send(PathBuf::from(path)).unwrap();
+                    }
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+                output
+            });
+            let error_reader = std::thread::spawn(move || {
+                let mut output = String::new();
+                std::io::BufReader::new(stderr).read_to_string(&mut output).unwrap();
+                output
+            });
+            let path = match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(path) => path,
+                Err(error) => {
+                    drop(processes);
+                    panic!("trace child failed before readiness: {error}\n{}\n{}", reader.join().unwrap(), error_reader.join().unwrap());
+                }
+            };
+            let tracer = std::process::Command::new("strace")
+                .arg("-f").arg("-yy").arg("-e").arg("trace=write")
+                .arg("-e").arg("inject=write:delay_enter=5s")
+                .arg("-P").arg(&path).arg("-p").arg(processes.child.id().to_string())
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped())
+                .spawn().expect("the Linux syscall lifetime test requires strace");
+            processes.tracer = Some(tracer);
+            let trace = processes.tracer.as_mut().unwrap().stderr.take().unwrap();
+            let (attached_tx, attached_rx) = std::sync::mpsc::channel();
+            let trace_reader = std::thread::spawn(move || {
+                let mut output = String::new();
+                let mut attached = false;
+                for line in std::io::BufReader::new(trace).lines() {
+                    let line = line.unwrap();
+                    if !attached && line.contains("attached") {
+                        attached_tx.send(()).unwrap();
+                        attached = true;
+                    }
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+                output
+            });
+            if let Err(error) = attached_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                drop(processes);
+                panic!("strace must attach before real IO is released: {error}\n{}\n{}\n{}", reader.join().unwrap(), error_reader.join().unwrap(), trace_reader.join().unwrap());
+            }
+            processes.child.stdin.take().unwrap().write_all(b"trace-ready\n").unwrap();
+            let released_at = std::time::Instant::now();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+            let status = loop {
+                if let Some(status) = processes.child.try_wait().unwrap() { break status; }
+                assert!(std::time::Instant::now() < deadline, "traced copy must finish within its functional budget");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            while processes.tracer.as_mut().unwrap().try_wait().unwrap().is_none() {
+                assert!(std::time::Instant::now() < deadline, "the syscall tracer must also finish within the functional budget");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let output = reader.join().unwrap();
+            let errors = error_reader.join().unwrap();
+            let trace = trace_reader.join().unwrap();
+            print!("{output}\n{errors}\n{trace}");
+            // strace5.5没有新版DELAYED标记。真实路径write记录、子方暂停状态
+            // 及显式五秒故障窗口共同证明生效；这不是文件性能阈值或SLA。
+            assert!(trace.contains("write(") && trace.contains(&path.display().to_string()), "the real staging syscall must be traced: {trace}");
+            assert!(released_at.elapsed() >= std::time::Duration::from_secs(4), "the configured syscall delay must actually take effect");
+            assert!(status.success(), "traced copy child failed\n{output}\n{errors}\n{trace}");
+            assert!(output.contains("1 passed; 0 failed; 0 ignored"));
+            return;
+        }
+
+        // SAFETY: 只允许本用例父进程及其tracer子进程调试此隔离进程，不改变
+        // 生产文件逻辑或其它进程的权限；进程退出后该调试资格自动消失。
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::getppid(), 0, 0, 0) }, 0);
+        let temporary = PathBuf::from(std::env::var_os("PI_ASYNC_FS_COPY_WRITER_TRACE_DIRECTORY").unwrap());
+        let source = temporary.join("source.bin");
+        let destination = temporary.join("destination.bin");
+        let root_path = temporary.join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(&source, b"AB").unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let namespace = LocalFileNamespace::new();
+        type Gate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>, Pin<Box<dyn Future<Output = ()> + Send>>);
+        fn queue_gate() -> Gate {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let future = blocking::unblock(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+            });
+            (release_tx, entered_rx, Box::pin(future))
+        }
+        fn enter(gates: &[Gate; 2]) {
+            for (_, entered, _) in gates {
+                entered.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            }
+        }
+        fn release(gates: [Gate; 2]) {
+            for (sender, _, future) in gates {
+                sender.send(()).unwrap();
+                block_on(future);
+            }
+        }
+        let mut gates = [queue_gate(), queue_gate()];
+        enter(&gates);
+        let mut copy = Box::pin(namespace.copy_new(&source, &destination));
+        assert!(block_on(futures_lite::future::poll_once(&mut copy)).is_none());
+        let staging_deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let staging_path = loop {
+            if let Some(path) = std::fs::read_dir(&temporary).unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension().is_some_and(|extension| extension == "copy"))
+            {
+                break path;
+            }
+            assert!(std::time::Instant::now() < staging_deadline, "real copy must create its staging before transfer");
+            if let Some(result) = block_on(futures_lite::future::poll_once(&mut copy)) {
+                panic!("copy finished before the staging observation: {result:?}");
+            }
+            let next = [queue_gate(), queue_gate()];
+            release(gates);
+            // 门只控制真实worker；给独立拥有型完成者调度机会，不把固定32次
+            // 观测轮数误当为生产阶段上限。业务仍只有一次两字节复制。
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            enter(&next);
+            gates = next;
+        };
+        assert_eq!(std::fs::metadata(&staging_path).unwrap().len(), 0);
+        let staging_pin = std::fs::File::open(&staging_path).unwrap();
+        let expected = staging_pin.metadata().unwrap();
+        std::fs::OpenOptions::new().write(true).open(&source).unwrap().set_len(1).unwrap();
+        // libtest的用例名前缀可能尚未换行；协议标记必须独占一行。
+        println!("\nPSA_TRACE_READY {}", staging_path.display());
+        std::io::stdout().flush().unwrap();
+        let mut ready = String::new();
+        std::io::stdin().read_line(&mut ready).unwrap();
+        assert_eq!(ready, "trace-ready\n");
+        release(gates);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let data_fd = loop {
+            let found = std::fs::read_dir("/proc/self/task").unwrap().find_map(|entry| {
+                let entry = entry.unwrap();
+                let call = std::fs::read_to_string(entry.path().join("syscall")).ok()?;
+                let mut fields = call.split_whitespace();
+                if fields.next()? != libc::SYS_write.to_string() { return None; }
+                let fd = i32::from_str_radix(fields.next()?.trim_start_matches("0x"), 16).ok()?;
+                let metadata = std::fs::metadata(format!("/proc/self/fd/{fd}")).ok()?;
+                let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
+                let paused = status.lines().any(|line| line.starts_with("State:\tt"));
+                (paused && metadata.dev() == expected.dev() && metadata.ino() == expected.ino()).then_some(fd)
+            });
+            if let Some(fd) = found { break fd; }
+            assert!(std::time::Instant::now() < deadline, "the real staging write must reach the traced syscall");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        let failure = block_on(copy).unwrap_err();
+        assert_eq!(failure.error().current_context(), &pi_result::ErrorKind::Corrupted);
+        assert_eq!(failure.target_evidence(), &CopyTargetEvidence::NotPublishedByOperation);
+        assert_eq!(failure.staging_evidence(), &CopyStagingEvidence::CreatedThenRemovedByOperation);
+        let root = Arc::new(CoordinationRootAnchor::open(root_path).unwrap());
+        let exclusive = OwnedOpenAdmission::try_acquire(root, staging_pin, OpenAdmissionKind::Exclusive)
+            .expect("completed copy must release the staging shared qualification");
+        fn data_file_is_open(fd: i32, expected: &std::fs::Metadata) -> bool {
+            match std::fs::metadata(format!("/proc/self/fd/{fd}")) {
+                Ok(metadata) => metadata.dev() == expected.dev() && metadata.ino() == expected.ino(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => panic!("native data FD observation failed: {error}"),
+            }
+        }
+        let file_closed_at_return = !data_file_is_open(data_fd, &expected);
+        // 不把编号失效即外推成物理页回收；这里只证明原数据文件打开已结束。
+        while data_file_is_open(data_fd, &expected) {
+            assert!(std::time::Instant::now() < deadline, "real paused writer must eventually close");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(exclusive);
+        assert!(!staging_path.exists());
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), b"A");
+        println!("COPY_WRITER_CLOSE_OBSERVATIONS qualification_released=true file_closed={file_closed_at_return}");
+        assert!(file_closed_at_return, "shared qualification must not be released before the real staging writer closes");
+        println!("EXCLUSIVE_CHILD_VERIFIED copy-writer-close");
+    }
+
+    // LIF-T01/T02：真实旧授权独活不能握住新SH资格；先记录最后候选释放
+    // 的独立锁/弱引用观测，再验证同凭据仍可重开。收尾完毕后断言，失败不遗留资源。
+    #[test]
+    fn test_local_authority_lifetime_idle_credential_releases_activity_and_can_reopen() {
+        if isolated("test_local_authority_lifetime_idle_credential_releases_activity_and_can_reopen") { return; }
+        let temporary = fixture();
+        let path = temporary.path().join("data.bin");
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(&path, b"credential-original").unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let namespace = LocalFileNamespace::new();
+        // SAFETY: 全部路径为本用例独占的真实夹具，没有旁路修改/进程，旧协议前提持续满足。
+        let authority = unsafe { block_on(namespace.establish_cross_process_authority(&path)) }.unwrap();
+        let (file, coordination) = block_on(opened(&path));
+        let weak = Arc::downgrade(&coordination);
+        let admitted = block_on(acquire_opened_local_file(path.clone(), file, coordination, OpenAdmissionKind::Shared)).unwrap();
+        drop(admitted);
+        let activity_released = weak.upgrade().is_none();
+        let root = Arc::new(CoordinationRootAnchor::open(root_path).unwrap());
+        let native_probe = OwnedOpenAdmission::try_acquire(
+            Arc::clone(&root), std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive,
+        );
+        let qualification_released = match native_probe {
+            Ok(admission) => { drop(admission); true }
+            Err(error) => {
+                assert_eq!(error.current_context(), &pi_result::ErrorKind::Conflict);
+                false
+            }
+        };
+        let reader = block_on(namespace.open_with_cross_process_authority(&authority, FileAccessMode::Read))
+            .expect("idle valid credential must remain usable after activity is reclaimed");
+        assert_eq!(block_on(reader.byte_len()).unwrap(), 19);
+        drop(reader);
+        drop(authority);
+        assert!(weak.upgrade().is_none(), "final credential cleanup must not retain old activity");
+        drop(OwnedOpenAdmission::try_acquire(
+            root, std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive,
+        ).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"credential-original");
+        println!("AUTHORITY_IDLE_OBSERVATIONS activity_released={activity_released} qualification_released={qualification_released}");
+        assert!(activity_released, "an idle credential is not an activity owner");
+        assert!(qualification_released, "an idle credential must not retain open qualification");
+        println!("EXCLUSIVE_CHILD_VERIFIED idle-credential");
+    }
+
+    // LIF-T02/T04：私有候选的真实资格与既有公共文件/RO克隆共享原核心。
+    // 最后映射释放后凭据仍可重开/汇合；两个旧凭据都不能访问或删除新代次。
+    // 此处只验证获准内外接缝的现有保活链；公开取得的组合证据由SI-069/071分别提供。
+    #[test]
+    fn test_local_authority_lifetime_mapping_clones_and_independent_credentials_compose() {
+        if isolated("test_local_authority_lifetime_mapping_clones_and_independent_credentials_compose") { return; }
+        let temporary = fixture();
+        let path = temporary.path().join("data.bin");
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(&path, b"0123456789abcdef").unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let namespace = LocalFileNamespace::new();
+        // SAFETY: 全部调用及映射来自同一协议，真实夹具独占且无旁路修改。
+        let first = unsafe { block_on(namespace.establish_cross_process_authority(&path)) }.unwrap();
+        // SAFETY: 与first相同真实实例和稳定名称，重复建立不改变合作域。
+        let second = unsafe { block_on(namespace.establish_cross_process_authority(&path)) }.unwrap();
+        let resource = block_on(namespace.open_with_cross_process_authority(&first, FileAccessMode::ReadMmap)).unwrap();
+        let file = block_on(async_fs::File::open(&path)).unwrap();
+        let candidate = block_on(acquire_opened_local_file(path.clone(), file, Arc::clone(&resource.coordination), OpenAdmissionKind::Shared)).unwrap();
+        let weak = Arc::downgrade(&candidate.coordination);
+        let root = Arc::new(CoordinationRootAnchor::open(root_path).unwrap());
+        let mapping = block_on(resource.map_read_only(MmapRange::new(0, 8).unwrap())).unwrap();
+        let cloned = mapping.clone();
+        drop(candidate);
+        drop(resource);
+        for current in [Some(mapping), None] {
+            assert_eq!(cloned.as_bytes(), b"01234567");
+            drop(current);
+            assert_eq!(OwnedOpenAdmission::try_acquire(
+                Arc::clone(&root), std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive,
+            ).unwrap_err().current_context(), &pi_result::ErrorKind::Conflict);
+        }
+        drop(cloned);
+        assert!(weak.upgrade().is_none());
+        drop(OwnedOpenAdmission::try_acquire(
+            Arc::clone(&root), std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive,
+        ).expect("idle credentials must not retain the last mapping qualification"));
+        let mut appender = block_on(namespace.open_with_cross_process_authority(&first, FileAccessMode::Append)).unwrap();
+        let reader = block_on(namespace.open_with_cross_process_authority(&second, FileAccessMode::Read)).unwrap();
+        block_on(appender.append(Vec::from(&b"-tail"[..]))).unwrap();
+        block_on(appender.flush(FileFlushMode::DataAndMetadata)).unwrap();
+        assert_eq!(block_on(reader.byte_len()).unwrap(), 21);
+        assert_eq!(std::fs::read(&path).unwrap(), b"0123456789abcdef-tail");
+        drop((appender, reader));
+        block_on(namespace.remove_file_with_cross_process_authority(&second)).unwrap();
+        block_on(namespace.remove_file_with_cross_process_authority(&first)).expect("other valid credential shares removed-instance idempotence");
+        assert!(!path.exists());
+        // SAFETY: 旧实例已通过协议退役；只有协调式创建发布新实例。
+        let replacement = unsafe { block_on(namespace.create_new_coordinated(path.clone(), FileAccessMode::Read)) }.unwrap();
+        let (replacement_authority, replacement_file) = replacement.into_parts();
+        for stale in [&first, &second] {
+            assert_eq!(block_on(namespace.open_with_cross_process_authority(stale, FileAccessMode::Read))
+                .err().expect("stale credential cannot open the replacement").current_context(), &pi_result::ErrorKind::Conflict);
+            assert_eq!(block_on(namespace.remove_file_with_cross_process_authority(stale))
+                .unwrap_err().error().current_context(), &pi_result::ErrorKind::Conflict);
+        }
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        drop(replacement_file);
+        block_on(namespace.remove_file_with_cross_process_authority(&replacement_authority)).unwrap();
+        assert!(!path.exists());
+        println!("EXCLUSIVE_CHILD_VERIFIED mapping-and-credentials");
+    }
+
+    // LIF-T04：真实取消后的追加/覆盖/截断/刷新任务必须先释放无人持有的文件槽，
+    // 再结束活动所有者。只用真实worker门及原生计数锁扩大观测窗口，不代补IO。
+    #[test]
+    fn test_local_authority_lifetime_cancelled_completion_closes_file_before_activity_release() {
+        if isolated("test_local_authority_lifetime_cancelled_completion_closes_file_before_activity_release") { return; }
+        let temporary = fixture();
+        let root_path = temporary.path().join("coordination");
+        std::fs::create_dir(&root_path).unwrap();
+        crate::set_cross_process_coordination_root(crate::CrossProcessCoordinationRoot::Custom(root_path.clone())).unwrap();
+        let namespace = LocalFileNamespace::new();
+        let root = Arc::new(CoordinationRootAnchor::open(root_path).unwrap());
+        let mut observations = Vec::new();
+        for operation in ["append", "overwrite", "truncate", "flush"] {
+            let path = temporary.path().join(format!("{operation}.bin"));
+            std::fs::write(&path, b"original").unwrap();
+            // SAFETY: 用例独占真实夹具，全部参与者使用同一协议，无旁路修改。
+            let authority = unsafe { block_on(namespace.establish_cross_process_authority(&path)) }.unwrap();
+            let role = match operation {
+                "overwrite" => FileAccessMode::Overwrite,
+                "truncate" => FileAccessMode::Truncate,
+                _ => FileAccessMode::Append,
+            };
+            let mut file = block_on(namespace.open_with_cross_process_authority(&authority, role)).unwrap();
+            let coordination = Arc::clone(&file.coordination);
+            let weak_coordination = Arc::downgrade(&coordination);
+            let candidate_file = block_on(async_fs::File::open(&path)).unwrap();
+            drop(block_on(acquire_opened_local_file(path.clone(), candidate_file, Arc::clone(&coordination), OpenAdmissionKind::Shared)).unwrap());
+            let native_core = file.cross_process_authority().unwrap();
+            let weak_file_slot = Arc::downgrade(&file.file);
+            let (first_started_sender, first_started_receiver) = std::sync::mpsc::channel();
+            let (first_release_sender, first_release_receiver) = std::sync::mpsc::channel();
+            let first_worker = blocking::unblock(move || {
+                first_started_sender.send(()).unwrap();
+                first_release_receiver.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+            });
+            first_started_receiver.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+            let mut pending: Pin<Box<dyn Future<Output = ()> + Send + '_>> = match operation {
+                "append" => Box::pin(async { file.append(Vec::from(&b"-tail"[..])).await.unwrap(); }),
+                "overwrite" => Box::pin(async { file.overwrite_all(Vec::from(&b"new"[..])).await.unwrap(); }),
+                "truncate" => Box::pin(async { file.truncate(3).await.unwrap(); }),
+                "flush" => Box::pin(async { file.flush(FileFlushMode::DataAndMetadata).await.unwrap(); }),
+                _ => unreachable!(),
+            };
+            assert!(block_on(futures_lite::future::poll_once(pending.as_mut())).is_none());
+            let (second_started_sender, second_started_receiver) = std::sync::mpsc::channel();
+            let (second_release_sender, second_release_receiver) = std::sync::mpsc::channel();
+            let second_worker = blocking::unblock(move || {
+                second_started_sender.send(()).unwrap();
+                second_release_receiver.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+            });
+            first_release_sender.send(()).unwrap();
+            block_on(first_worker);
+            second_started_receiver.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+            assert!(block_on(futures_lite::future::poll_once(pending.as_mut())).is_none());
+            // 截断在提交前读取长度，第三个真实执行门只让这一步先结束，
+            // 然后保留真正set_len任务；不能把取消提交前准备冒充完成链验证。
+            let (last_release_sender, last_worker) = if operation == "truncate" {
+                let (third_started_sender, third_started_receiver) = std::sync::mpsc::channel();
+                let (third_release_sender, third_release_receiver) = std::sync::mpsc::channel();
+                let third_worker = blocking::unblock(move || {
+                    third_started_sender.send(()).unwrap();
+                    third_release_receiver.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+                });
+                second_release_sender.send(()).unwrap();
+                block_on(second_worker);
+                third_started_receiver.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+                assert!(block_on(futures_lite::future::poll_once(pending.as_mut())).is_none());
+                (third_release_sender, third_worker)
+            } else {
+                (second_release_sender, second_worker)
+            };
+            drop(pending);
+            drop(file);
+            // 已提交的真实任务独自拥有剩余活动；若仍在准备阶段，此断言显式失败。
+            assert_eq!(lock_unpoisoned(&coordination.data).coordinated_resources, 1);
+            let native_state = lock_unpoisoned(&native_core.lifecycle_state);
+            last_release_sender.send(()).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while lock_unpoisoned(&coordination.data).coordinated_resources != 0
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let activity_releasing = lock_unpoisoned(&coordination.data).coordinated_resources == 0;
+            let file_closed_before_release = weak_file_slot.upgrade().is_none();
+            drop(native_state);
+            block_on(last_worker);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while weak_file_slot.upgrade().is_some() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(weak_file_slot.upgrade().is_none(), "real completion must release the file slot");
+            drop(coordination);
+            // 文件已先关闭不等于后续租约析构已结束；等待真实完成，不把解除
+            // 观测锁或Weak变空当成同步完成/原生资格已经释放的证据。
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while weak_coordination.upgrade().is_some() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(weak_coordination.upgrade().is_none());
+            loop {
+                match OwnedOpenAdmission::try_acquire(
+                    Arc::clone(&root), std::fs::File::open(&path).unwrap(), OpenAdmissionKind::Exclusive,
+                ) {
+                    Ok(admission) => { drop(admission); break; }
+                    Err(error) => {
+                        assert_eq!(error.current_context(), &pi_result::ErrorKind::Conflict);
+                        assert!(std::time::Instant::now() < deadline, "real completion must release native qualification");
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+            let expected: &[u8] = match operation {
+                "append" => b"original-tail", "overwrite" => b"new", "truncate" => b"ori", "flush" => b"original", _ => unreachable!(),
+            };
+            assert_eq!(std::fs::read(&path).unwrap(), expected);
+            observations.push((operation, activity_releasing, file_closed_before_release));
+        }
+        println!("COMPLETION_CLOSE_OBSERVATIONS {observations:?}");
+        for (operation, activity_releasing, file_closed) in observations {
+            assert!(activity_releasing, "actual task must reach activity release; operation={operation}");
+            assert!(file_closed, "file must close before activity release; operation={operation}");
+        }
+        println!("EXCLUSIVE_CHILD_VERIFIED cancelled-completion-file-close");
     }
 }
